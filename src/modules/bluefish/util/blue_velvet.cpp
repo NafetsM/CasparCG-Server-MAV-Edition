@@ -55,10 +55,10 @@ BLUE_U32 bvc_wrapper::set_multilink(const int iDeviceID, const int memChannel)
 
     blue_multi_link_info_struct attach_info = {};
     attach_info.InputControl                = 1;
-    attach_info.Link1_Device = iDeviceID;
-    attach_info.Link2_Device = iDeviceID;
-    attach_info.Link3_Device = iDeviceID;
-    attach_info.Link4_Device = iDeviceID;
+    attach_info.Link1_Device                = iDeviceID;
+    attach_info.Link2_Device                = iDeviceID;
+    attach_info.Link3_Device                = iDeviceID;
+    attach_info.Link4_Device                = iDeviceID;
 
     if (memChannel == BLUE_VIDEO_INPUT_CHANNEL_1) {
         attach_info.Link1_MemChannel = BLUE_VIDEO_INPUT_CHANNEL_1;
@@ -128,11 +128,11 @@ BLUE_U32 bvc_wrapper::system_buffer_read(unsigned char* pPixels,
 #if 1
     return bfcSystemBufferReadAsync(bvc_.get(), pPixels, ulSize, nullptr, ulBufferID, ulOffset);
 #else
-    BFC_SYNC_INFO bsi = bfcSyncInfoCreate(bvc_.get());
-    BLUE_U32 retVal = 0;
+    BFC_SYNC_INFO bsi    = bfcSyncInfoCreate(bvc_.get());
+    BLUE_U32      retVal = 0;
     retVal               = bfcDmaReadFromCardAsync(bvc_.get(), pPixels, ulSize, bsi, ulBufferID, ulOffset);
-    int wrv = bfcSyncInfoWait(bvc_.get(), bsi, 20);
-    int x = wrv + 0;
+    int wrv              = bfcSyncInfoWait(bvc_.get(), bsi, 20);
+    int x                = wrv + 0;
     x++;
     bfcSyncInfoDelete(bvc_.get(), bsi);
     return retVal;
@@ -443,6 +443,7 @@ bool is_kronos_card(bvc_wrapper& blue)
     switch (card_type) {
         case CRD_BLUE_KRONOS_ELEKTRON:
         case CRD_BLUE_KRONOS_OPTIKOS:
+        case CRD_BLUE_KRONOS_K8:
             return true;
         default:
             return false;
@@ -516,6 +517,9 @@ std::wstring get_card_desc(bvc_wrapper blue, int device_id)
             break;
         case CRD_BLUE_KRONOS_OPTIKOS:
             card_desc = L"Bluefish Kronos Optikos";
+            break;
+        case CRD_BLUE_KRONOS_K8:
+            card_desc = L"Bluefish Kronos K8";
             break;
         default:
             card_desc = L"Unknown";

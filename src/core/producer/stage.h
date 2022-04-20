@@ -58,8 +58,10 @@ class stage final
 
     explicit stage(int channel_index, spl::shared_ptr<caspar::diagnostics::graph> graph);
 
-    std::map<int, layer_frame>
-    operator()(const video_format_desc& format_desc, int nb_samples, std::vector<int>& fetch_background);
+    std::vector<draw_frame> operator()(const video_format_desc&                     format_desc,
+                                       int                                          nb_samples,
+                                       std::vector<int>&                            fetch_background,
+                                       std::function<void(int, const layer_frame&)> routesCb);
 
     std::future<void> apply_transforms(const std::vector<transform_tuple_t>& transforms);
     std::future<void>
@@ -69,6 +71,7 @@ class stage final
     std::future<frame_transform> get_current_transform(int index);
     std::future<void>
                               load(int index, const spl::shared_ptr<frame_producer>& producer, bool preview = false, bool auto_play = false);
+    std::future<void>         preview(int index);
     std::future<void>         pause(int index);
     std::future<void>         resume(int index);
     std::future<void>         play(int index);

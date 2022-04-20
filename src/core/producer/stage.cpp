@@ -32,6 +32,7 @@
 #include <common/future.h>
 
 #include <core/frame/frame_transform.h>
+#include <core/producer/route/route_producer.h>
 
 #include <boost/range/adaptors.hpp>
 
@@ -49,8 +50,48 @@ struct stage::impl : public std::enable_shared_from_this<impl>
     monitor::state                      state_;
     std::map<int, layer>                layers_;
     std::map<int, tweened_transform>    tweens_;
+    std::set<int>                       routeSources;
 
     executor executor_{L"stage " + std::to_wstring(channel_index_)};
+
+  private:
+    void orderSourceLayers(std::vector<std::pair<int, bool>>&        layerVec,
+                           const std::map<int, std::pair<int, int>>& routed_layers,
+                           int                                       l,
+                           int                                       depth)
+    {
+        if (0 == depth)
+            routeSources.clear();
+
+        if (std::find_if(layerVec.begin(), layerVec.end(), [l](std::pair<int, bool> p) { return p.first == l; }) != layerVec.end()) {
+            return;
+        }
+
+        auto routeIt = routed_layers.find(l);
+        if (routed_layers.end() == routeIt) {
+            layerVec.push_back(std::make_pair(l, true));
+            return;
+        }
+
+        std::pair<int, int> routeSrc(routeIt->second);
+        if (channel_index_ != routeSrc.first) {
+            layerVec.push_back(std::make_pair(l, true));
+            return;
+        }
+
+        // check for circular route setup - skip recursion if found
+        routeSources.emplace(routeSrc.second);
+        bool layerOK = true;
+        if (routeSources.find(l) == routeSources.end()) {
+            orderSourceLayers(layerVec, routed_layers, routeSrc.second, ++depth);
+        } else {
+            layerOK = false;
+        }
+
+        if (std::find_if(layerVec.begin(), layerVec.end(), [l](std::pair<int, bool> p) { return p.first == l; }) == layerVec.end()) {
+            layerVec.push_back(std::make_pair(l, layerOK));
+        }
+    }
 
   public:
     impl(int channel_index, spl::shared_ptr<diagnostics::graph> graph)
@@ -59,29 +100,67 @@ struct stage::impl : public std::enable_shared_from_this<impl>
     {
     }
 
-    std::map<int, layer_frame>
-    operator()(const video_format_desc& format_desc, int nb_samples, std::vector<int>& fetch_background)
+    std::vector<draw_frame> operator()(const video_format_desc&                     format_desc,
+                                       int                                          nb_samples,
+                                       std::vector<int>&                            fetch_background,
+                                       std::function<void(int, const layer_frame&)> routesCb)
     {
         return executor_.invoke([=] {
             std::map<int, layer_frame> frames;
+            std::vector<draw_frame>    stage_frames;
 
             try {
                 for (auto& t : tweens_)
                     t.second.tick(1);
 
+                // build a map of layers that are sourced from route producers
+                std::map<int, std::pair<int, int>> routed_layers;
                 for (auto& p : layers_) {
-                    auto& layer = p.second;
-                    auto& tween = tweens_[p.first];
+                    auto producer = std::move(p.second.foreground());
+                    if (0 == producer->name().compare(L"route")) {
+                        try {
+                            auto rc       = spl::dynamic_pointer_cast<core::route_control>(producer);
+                            auto srcChan  = rc->get_source_channel();
+                            auto srcLayer = rc->get_source_layer();
+                            routed_layers.emplace(p.first, std::make_pair(srcChan, srcLayer));
+                            rc->set_cross_channel(channel_index_ != srcChan);
+                        } catch (std::bad_cast) {
+                            CASPAR_LOG(error) << "Failed to cast route producer";
+                        }
+                    }
+                }
+
+                // sort layer order so that sources get pulled before routes
+                std::vector<std::pair<int, bool>> layerVec;
+                for (auto& p : layers_)
+                    orderSourceLayers(layerVec, routed_layers, p.first, 0);
+
+                for (auto& l : layerVec) {
+                    auto  p     = layers_.find(l.first);
+                    auto& layer = p->second;
+                    auto& tween = tweens_[p->first];
 
                     layer_frame res    = {};
-                    res.foreground     = draw_frame::push(layer.receive(format_desc, nb_samples), tween.fetch());
+                    res.foreground     = draw_frame::push(l.second ? layer.receive(format_desc, nb_samples) : draw_frame(), tween.fetch());
                     res.has_background = layer.has_background();
-                    if (std::find(fetch_background.begin(), fetch_background.end(), p.first) !=
+                    if (std::find(fetch_background.begin(), fetch_background.end(), p->first) !=
                         fetch_background.end()) {
                         res.background = layer.receive_background(format_desc, nb_samples);
                     }
-                    frames[p.first] = res;
+                    frames[p->first] = res;
+
+                    // push received foreground frame to any configured route producer
+                    routesCb(p->first, res);
                 }
+
+                for (auto& p : frames) {
+                    stage_frames.push_back(p.second.foreground);
+                }
+
+                // push stage_frames to support any channel routes that have been set
+                layer_frame chan_lf = {};
+                chan_lf.foreground  = draw_frame(stage_frames);
+                routesCb(-1, chan_lf);
 
                 monitor::state state;
                 for (auto& p : layers_) {
@@ -93,7 +172,7 @@ struct stage::impl : public std::enable_shared_from_this<impl>
                 CASPAR_LOG_CURRENT_EXCEPTION();
             }
 
-            return frames;
+            return stage_frames;
         });
     }
 
@@ -150,6 +229,11 @@ struct stage::impl : public std::enable_shared_from_this<impl>
     std::future<void> load(int index, const spl::shared_ptr<frame_producer>& producer, bool preview, bool auto_play)
     {
         return executor_.begin_invoke([=] { get_layer(index).load(producer, preview, auto_play); });
+    }
+    
+	std::future<void> preview(int index)
+    {
+        return executor_.begin_invoke([=] { get_layer(index).preview(); });
     }
 
     std::future<void> pause(int index)
@@ -290,6 +374,7 @@ std::future<void> stage::load(int index, const spl::shared_ptr<frame_producer>& 
 {
     return impl_->load(index, producer, preview, auto_play);
 }
+std::future<void> stage::preview(int index) { return impl_->preview(index); }
 std::future<void> stage::pause(int index) { return impl_->pause(index); }
 std::future<void> stage::resume(int index) { return impl_->resume(index); }
 std::future<void> stage::play(int index) { return impl_->play(index); }
@@ -310,10 +395,12 @@ std::future<void> stage::swap_layer(int index, int other_index, stage& other, bo
 }
 std::future<std::shared_ptr<frame_producer>> stage::foreground(int index) { return impl_->foreground(index); }
 std::future<std::shared_ptr<frame_producer>> stage::background(int index) { return impl_->background(index); }
-std::map<int, layer_frame>                   stage::
-                                             operator()(const video_format_desc& format_desc, int nb_samples, std::vector<int>& fetch_background)
+std::vector<draw_frame> stage::operator()(const video_format_desc&                     format_desc,
+                                          int                                          nb_samples,
+                                          std::vector<int>&                            fetch_background,
+                                          std::function<void(int, const layer_frame&)> routesCb)
 {
-    return (*impl_)(format_desc, nb_samples, fetch_background);
+    return (*impl_)(format_desc, nb_samples, fetch_background, routesCb);
 }
 core::monitor::state stage::state() const { return impl_->state_; }
 }} // namespace caspar::core

@@ -17,6 +17,7 @@ extern "C" {
 #endif
 
 #include <tbb/parallel_for.h>
+#include <tbb/parallel_invoke.h>
 
 namespace caspar { namespace ffmpeg {
 
@@ -41,33 +42,39 @@ core::mutable_frame make_frame(void*                    tag,
                                std::shared_ptr<AVFrame> video,
                                std::shared_ptr<AVFrame> audio)
 {
+    std::vector<int> data_map; // TODO(perf) when using data_map, avoid uploading duplicate planes
+
     const auto pix_desc =
-        video ? pixel_format_desc(static_cast<AVPixelFormat>(video->format), video->width, video->height)
+        video ? pixel_format_desc(static_cast<AVPixelFormat>(video->format), video->width, video->height, data_map)
               : core::pixel_format_desc(core::pixel_format::invalid);
 
     auto frame = frame_factory.create_frame(tag, pix_desc);
 
-    if (video) {
-        for (int n = 0; n < static_cast<int>(pix_desc.planes.size()); ++n) {
-            tbb::parallel_for(0, pix_desc.planes[n].height, [&](int y) {
-                std::memcpy(frame.image_data(n).begin() + y * pix_desc.planes[n].linesize,
-                            video->data[n] + y * video->linesize[n],
-                            pix_desc.planes[n].linesize);
-            });
-        }
-    }
+    tbb::parallel_invoke([&]() {
+        if (video) {
+            for (int n = 0; n < static_cast<int>(pix_desc.planes.size()); ++n) {
+                auto frame_plan_index = data_map.empty() ? n : data_map.at(n);
 
-    if (audio) {
-        // TODO This is a bit of a hack
-        frame.audio_data() = std::vector<int32_t>(audio->nb_samples * 8, 0);
-        auto dst           = frame.audio_data().data();
-        auto src           = reinterpret_cast<int32_t*>(audio->data[0]);
-        tbb::parallel_for(0, audio->nb_samples, [&](int i) {
-            for (auto j = 0; j < std::min(8, audio->channels); ++j) {
-                dst[i * 8 + j] = src[i * audio->channels + j];
+                tbb::parallel_for(0, pix_desc.planes[n].height, [&](int y) {
+                    std::memcpy(frame.image_data(n).begin() + y * pix_desc.planes[n].linesize,
+                                video->data[frame_plan_index] + y * video->linesize[frame_plan_index],
+                                pix_desc.planes[n].linesize);
+                });
             }
-        });
-    }
+        }
+    }, [&]() {
+        if (audio) {
+            // TODO This is a bit of a hack
+            frame.audio_data() = std::vector<int32_t>(audio->nb_samples * 8, 0);
+            auto dst = frame.audio_data().data();
+            auto src = reinterpret_cast<int32_t*>(audio->data[0]);
+            for (auto i = 0; i < audio->nb_samples; i++) {
+                for (auto j = 0; j < std::min(8, audio->channels); ++j) {
+                    dst[i * 8 + j] = src[i * audio->channels + j];
+                }
+            }
+        }
+    });
 
     return frame;
 }
@@ -105,12 +112,14 @@ core::pixel_format get_pixel_format(AVPixelFormat pix_fmt)
             return core::pixel_format::ycbcra;
         case AV_PIX_FMT_YUVA444P:
             return core::pixel_format::ycbcra;
+        case AV_PIX_FMT_UYVY422:
+            return core::pixel_format::uyvy;
         default:
             return core::pixel_format::invalid;
     }
 }
 
-core::pixel_format_desc pixel_format_desc(AVPixelFormat pix_fmt, int width, int height)
+core::pixel_format_desc pixel_format_desc(AVPixelFormat pix_fmt, int width, int height, std::vector<int>& data_map)
 {
     // Get linesizes
     AVPicture dummy_pict;
@@ -148,6 +157,16 @@ core::pixel_format_desc pixel_format_desc(AVPixelFormat pix_fmt, int width, int 
 
             if (desc.format == core::pixel_format::ycbcra)
                 desc.planes.push_back(core::pixel_format_desc::plane(dummy_pict.linesize[3], height, 1));
+
+            return desc;
+        }
+        case core::pixel_format::uyvy: {
+            desc.planes.push_back(core::pixel_format_desc::plane(dummy_pict.linesize[0] / 2, height, 2));
+            desc.planes.push_back(core::pixel_format_desc::plane(dummy_pict.linesize[0] / 4, height, 4));
+
+            data_map.clear();
+            data_map.push_back(0);
+            data_map.push_back(0);
 
             return desc;
         }
@@ -253,63 +272,6 @@ std::shared_ptr<AVFrame> make_av_audio_frame(const core::const_frame& frame, con
     std::memcpy(av_frame->data[0], buffer.data(), buffer.size() * sizeof(buffer.data()[0]));
 
     return av_frame;
-}
-
-int graph_execute(struct AVFilterContext* ctx, avfilter_action_func* func, void* arg, int* ret, int count)
-{
-    if (count == 0) {
-        return 0;
-    }
-
-    tbb::parallel_for(0, count, [&](int n) {
-        int r = func(ctx, arg, n, count);
-        if (ret) {
-            ret[n] = r;
-        }
-    });
-
-    return 0;
-}
-
-int codec_execute(AVCodecContext* c,
-                  int (*func)(AVCodecContext* c2, void* arg),
-                  void* arg2,
-                  int*  ret,
-                  int   count,
-                  int   size)
-{
-    tbb::parallel_for(0, count, 1, [&](int i) {
-        int r = func(c, (char*)arg2 + i * size);
-        if (ret) {
-            ret[i] = r;
-        }
-    });
-
-    return 0;
-}
-
-int codec_execute2(AVCodecContext* c,
-                   int (*func)(AVCodecContext* c2, void* arg, int jobnr, int threadnr),
-                   void* arg2,
-                   int*  ret,
-                   int   count)
-{
-    std::array<std::vector<int>, 128> jobs;
-
-    for (int jobnr = 0; jobnr < count; ++jobnr) {
-        jobs[jobnr * c->thread_count / count].push_back(jobnr);
-    }
-
-    tbb::parallel_for<int>(0, c->thread_count, [&](int threadnr) {
-        for (auto jobnr : jobs[threadnr]) {
-            int r = func(c, arg2, jobnr, threadnr);
-            if (ret) {
-                ret[jobnr] = r;
-            }
-        }
-    });
-
-    return 0;
 }
 
 AVDictionary* to_dict(std::map<std::string, std::string>&& map)

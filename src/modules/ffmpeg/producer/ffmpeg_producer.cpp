@@ -71,7 +71,8 @@ struct ffmpeg_producer : public core::frame_producer
                              std::wstring                         afilter,
                              boost::optional<int64_t>             start,
                              boost::optional<int64_t>             duration,
-                             boost::optional<bool>                loop)
+                             boost::optional<bool>                loop,
+                             int                                  seekable)
         : filename_(filename)
         , frame_factory_(frame_factory)
         , format_desc_(format_desc)
@@ -83,7 +84,8 @@ struct ffmpeg_producer : public core::frame_producer
                                    u8(afilter),
                                    start,
                                    duration,
-                                   loop))
+                                   loop,
+                                   seekable))
     {
     }
 
@@ -194,12 +196,7 @@ struct ffmpeg_producer : public core::frame_producer
 
 boost::tribool has_valid_extension(const std::wstring& filename)
 {
-    static const auto invalid_exts = {L".png",
-                                      L".tga",
-                                      L".bmp",
-                                      L".jpg",
-                                      L".jpeg",
-                                      L".gif",
+    static const auto invalid_exts = {L".tga",
                                       L".tiff",
                                       L".tif",
                                       L".jp2",
@@ -210,21 +207,9 @@ boost::tribool has_valid_extension(const std::wstring& filename)
                                       L".ct",
                                       L".html",
                                       L".htm"};
-    static const auto valid_exts   = {L".m2t",
-                                    L".mov",
-                                    L".mp4",
-                                    L".dv",
-                                    L".flv",
-                                    L".mpg",
-                                    L".dnxhd",
-                                    L".h264",
-                                    L".prores",
-                                    L".mkv",
-                                    L".mxf",
-                                    L".ts",
-                                    L".mp3",
-                                    L".wav",
-                                    L".wma"};
+    static const auto valid_exts   = {L".m2t",  L".m2ts",   L".mov",  L".mp4", L".dv",  L".flv", L".mpg",  L".dnxhd",
+                                    L".h264", L".prores", L".mkv",  L".mxf", L".ts",  L".mp3", L".wav",  L".wma",
+                                    L".nut",  L".flac",   L".opus", L".ogg", L".ogv", L".oga", L".webm", L".webp"};
 
     auto ext = boost::to_lower_copy(boost::filesystem::path(filename).extension().wstring());
 
@@ -330,6 +315,8 @@ spl::shared_ptr<core::frame_producer> create_producer(const core::frame_producer
         return core::frame_producer::empty();
     }
 
+    auto seekable = get_param(L"SEEKABLE", params, static_cast<int>(2));
+
     auto loop = contains_param(L"LOOP", params);
 
     auto in = get_param(L"SEEK", params, static_cast<uint32_t>(0)); // compatibility
@@ -365,7 +352,7 @@ spl::shared_ptr<core::frame_producer> create_producer(const core::frame_producer
 
     try {
         auto producer = spl::make_shared<ffmpeg_producer>(
-            dependencies.frame_factory, dependencies.format_desc, name, path, vfilter, afilter, start, duration, loop);
+            dependencies.frame_factory, dependencies.format_desc, name, path, vfilter, afilter, start, duration, loop, seekable);
         return core::create_destroy_proxy(std::move(producer));
     } catch (...) {
         CASPAR_LOG_CURRENT_EXCEPTION();

@@ -22,7 +22,6 @@
 // tbbmalloc_proxy:
 // Replace the standard memory allocation routines in Microsoft* C/C++ RTL
 // (malloc/free, global new/delete, etc.) with the TBB memory allocator.
-#include <tbb/task_scheduler_init.h>
 
 #if defined _DEBUG && defined _MSC_VER
 #define _CRTDBG_MAP_ALLOC
@@ -53,6 +52,7 @@
 
 #include <atomic>
 #include <future>
+#include <thread>
 
 #include <clocale>
 #include <csignal>
@@ -213,7 +213,6 @@ int main(int argc, char** argv)
     // Increase process priority.
     increase_process_priority();
 
-    tbb::task_scheduler_init init;
     std::wstring             config_file_name(L"casparcg.config");
 
     try {

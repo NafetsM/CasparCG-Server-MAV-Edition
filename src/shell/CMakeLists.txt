@@ -49,12 +49,12 @@ target_link_libraries(casparcg
 
 if (MSVC)
 	target_link_libraries(casparcg
-		#jpeg.lib
-		#sndfile.lib
 		Winmm.lib
 		Ws2_32.lib
 		optimized tbb.lib
+		optimized tbbmalloc.lib
 		debug tbb_debug.lib
+		debug tbbmalloc_debug.lib
 		OpenGL32.lib
 		glew32.lib
 		openal32.lib
@@ -74,7 +74,7 @@ if (MSVC)
 		avdevice.lib
 		swscale.lib
 		swresample.lib
-		
+
 		d3d9.lib
 		d3d11.lib
 		dxgi.lib
@@ -89,9 +89,6 @@ else ()
 		${GLEW_LIBRARIES}
 		${OPENGL_gl_LIBRARY}
 		${X11_LIBRARIES}
-		${JPEG_LIBRARIES}
-		${SNDFILE_LIBRARIES}
-		${FREETYPE_LIBRARIES}
 		${FFMPEG_LIBRARIES}
 		dl
 		icui18n
@@ -99,6 +96,8 @@ else ()
 		z
 		pthread
 	)
+
+    set_target_properties(casparcg PROPERTIES INSTALL_RPATH "$ORIGIN/../lib" BUILD_WITH_INSTALL_RPATH ON)
 endif ()
 
 add_custom_target(casparcg_copy_dependencies ALL)

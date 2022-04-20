@@ -75,21 +75,21 @@ enum class bluefish_hardware_output_channel
 
 enum class uhd_output_option
 {
-    disable_BVC_MultiLink   = 0,
-    auto_uhd                = 1,
-    force_2si               = 2,
-    force_square_division   = 3,
+    disable_BVC_MultiLink = 0,
+    auto_uhd              = 1,
+    force_2si             = 2,
+    force_square_division = 3,
 };
 
 struct configuration
 {
-    unsigned int                            device_index         = 1;
-    bluefish_hardware_output_channel        device_stream        = bluefish_hardware_output_channel::channel_1;
-    bool                                    embedded_audio       = true;
-    hardware_downstream_keyer_mode          hardware_keyer_value = hardware_downstream_keyer_mode::disable;
-    hardware_downstream_keyer_audio_source  keyer_audio_source =
+    unsigned int                           device_index         = 1;
+    bluefish_hardware_output_channel       device_stream        = bluefish_hardware_output_channel::channel_1;
+    bool                                   embedded_audio       = true;
+    hardware_downstream_keyer_mode         hardware_keyer_value = hardware_downstream_keyer_mode::disable;
+    hardware_downstream_keyer_audio_source keyer_audio_source =
         hardware_downstream_keyer_audio_source::VideoOutputChannel;
-    unsigned int                            watchdog_timeout = 2;
+    unsigned int      watchdog_timeout = 2;
     uhd_output_option uhd_mode         = uhd_output_option::disable_BVC_MultiLink;
 };
 
@@ -168,7 +168,8 @@ struct bluefish_consumer
     const configuration config_;
 
     spl::shared_ptr<bvc_wrapper> blue_ = create_blue(config_.device_index);
-
+    spl::shared_ptr<bvc_wrapper> watchdog_bvc_ = create_blue(config_.device_index);
+    
     std::mutex         exception_mutex_;
     std::exception_ptr exception_;
 
@@ -238,8 +239,7 @@ struct bluefish_consumer
         // Specify the video channel
         setup_hardware_output_channel(); // ie stream id
 
-        model_name_ = get_card_desc(*blue_.get(), (int)config_.device_index);
-        configure_watchdog();
+        model_name_ = get_card_desc(*blue_.get(), (int)config_.device_index); 
 
         // disable the video output while we do all the config.
         disable_video_output();
@@ -317,7 +317,8 @@ struct bluefish_consumer
             SetThreadPriority(handle, THREAD_PRIORITY_HIGHEST);
 #endif
         }
-
+            
+        configure_watchdog();
         enable_video_output();
     }
 
@@ -331,6 +332,7 @@ struct bluefish_consumer
                 disable_watchdog();
 
             disable_video_output();
+            watchdog_bvc_->detach();
             blue_->detach();
 
             if (dma_present_thread_)
@@ -345,20 +347,21 @@ struct bluefish_consumer
 
     void watchdog_thread_actual()
     {
-        bvc_wrapper watchdog_bvc;
-        watchdog_bvc.attach(config_.device_index);
+        watchdog_bvc_->attach(config_.device_index);
         EBlueVideoChannel out_vid_channel = get_bluesdk_videochannel_from_streamid(config_.device_stream);
-        watchdog_bvc.set_card_property32(DEFAULT_VIDEO_OUTPUT_CHANNEL, out_vid_channel);
+        watchdog_bvc_->set_card_property32(DEFAULT_VIDEO_OUTPUT_CHANNEL, out_vid_channel);
+
         unsigned long fc = 0;
         unsigned int  blue_prop =
             EPOCH_WATCHDOG_TIMER_SET_MACRO(enum_blue_app_watchdog_timer_keepalive, config_.watchdog_timeout);
 
         while (!end_hardware_watchdog_thread_) {
-            watchdog_bvc.wait_video_output_sync(UPD_FMT_FIELD, &fc);
-            blue_->set_card_property32(EPOCH_APP_WATCHDOG_TIMER, blue_prop);
+            watchdog_bvc_->wait_video_output_sync(UPD_FMT_FIELD, &fc);
+            watchdog_bvc_->set_card_property32(EPOCH_APP_WATCHDOG_TIMER, blue_prop);
         }
+
         disable_watchdog();
-        watchdog_bvc.detach();
+        watchdog_bvc_->detach();
     }
 
     void configure_watchdog()
@@ -379,8 +382,8 @@ struct bluefish_consumer
                 blue_prop = EPOCH_WATCHDOG_TIMER_SET_MACRO(enum_blue_app_watchdog_timer_start_stop, (unsigned int)0);
                 blue_->set_card_property32(EPOCH_APP_WATCHDOG_TIMER, blue_prop);
             }
-
-            // Setting up the watchdog properties
+           
+            // Setting up the watchdog properties 
             unsigned int watchdog_timer_gpo_port = 1; // GPO port to use: 0 = none, 1 = port A, 2 = port B
             blue_prop =
                 EPOCH_WATCHDOG_TIMER_SET_MACRO(enum_blue_app_watchdog_enable_gpo_on_active, watchdog_timer_gpo_port);
@@ -406,7 +409,7 @@ struct bluefish_consumer
         end_hardware_watchdog_thread_ = true;
         unsigned int stop_value       = 0;
         unsigned int blue_prop = EPOCH_WATCHDOG_TIMER_SET_MACRO(enum_blue_app_watchdog_timer_start_stop, stop_value);
-        blue_->get_card_property32(EPOCH_APP_WATCHDOG_TIMER, &blue_prop);
+        watchdog_bvc_->get_card_property32(EPOCH_APP_WATCHDOG_TIMER, &blue_prop);
     }
 
     void setup_hardware_output_channel()
@@ -491,6 +494,12 @@ struct bluefish_consumer
                         if (blue_->set_card_property32(VIDEO_GENLOCK_SIGNAL, genlock_source))
                             CASPAR_THROW_EXCEPTION(caspar_exception()
                                                    << msg_info("Failed to set GenLock to Aux Input."));
+                    } else if (blue_video_output_channel == BLUE_VIDEO_OUTPUT_CHANNEL_B) {
+                        ULONG routing_value = EPOCH_SET_ROUTING(EPOCH_SRC_OUTPUT_MEM_INTERFACE_CHB,
+                                                                EPOCH_DEST_SDI_OUTPUT_B,
+                                                                BLUE_CONNECTOR_PROP_DUALLINK_LINK_1);
+                        if (blue_->set_card_property32(MR2_ROUTING, routing_value))
+                            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Failed to MR 2 routing."));
                     }
                 }
             } else // dual Link IS enabled, ie. 4224 Fill and Key
@@ -549,7 +558,7 @@ struct bluefish_consumer
     void setup_hardware_downstream_keyer(hardware_downstream_keyer_mode         keyer,
                                          hardware_downstream_keyer_audio_source audio_source)
     {
-        unsigned int keyer_control_value  = 0;
+        unsigned int keyer_control_value = 0;
         if (keyer == hardware_downstream_keyer_mode::disable || keyer == hardware_downstream_keyer_mode::external) {
             keyer_control_value = VIDEO_ONBOARD_KEYER_SET_STATUS_DISABLED(keyer_control_value);
             keyer_control_value = VIDEO_ONBOARD_KEYER_SET_STATUS_DISABLE_OVER_BLACK(keyer_control_value);
@@ -750,13 +759,12 @@ struct bluefish_consumer
                 void* dest = buf->image_data();
                 if (frame.image_data(0).size()) {
                     if (config_.uhd_mode == uhd_output_option::force_2si) {
-                        // Do the Square Division top 2si conversion here.                      
-                        blue_->convert_sq_to_2si((int)frame.width(), (int)frame.height(), (void*)frame.image_data(0).begin(), dest);
-                    }
-                    else
+                        // Do the Square Division top 2si conversion here.
+                        blue_->convert_sq_to_2si(
+                            (int)frame.width(), (int)frame.height(), (void*)frame.image_data(0).begin(), dest);
+                    } else
                         std::memcpy(dest, frame.image_data(0).begin(), frame.image_data(0).size());
-                }
-                else
+                } else
                     std::memset(dest, 0, buf->image_size());
 
                 // encode and copy hanc data
@@ -965,7 +973,7 @@ create_preconfigured_consumer(const boost::property_tree::wptree&               
 
     auto uhd_mode   = ptree.get(L"uhd-mode", 0);
     config.uhd_mode = uhd_output_option::disable_BVC_MultiLink;
-    if(uhd_mode == 1)
+    if (uhd_mode == 1)
         config.uhd_mode = uhd_output_option::auto_uhd;
     else if (uhd_mode == 2)
         config.uhd_mode = uhd_output_option::force_2si;
