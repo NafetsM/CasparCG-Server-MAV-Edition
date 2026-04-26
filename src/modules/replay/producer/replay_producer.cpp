@@ -17,6 +17,7 @@
 #include <core/video_format.h>
 #include <core/monitor/monitor.h>
 
+#include <common/array.h>
 #include <common/future.h>
 #include <common/env.h>
 #include <common/array.h>
@@ -265,7 +266,8 @@ struct replay_producer : public core::frame_producer
         if (audio_ && audio_data_length > 0 && audio_data)
         {
             auto num_samples = audio_data_length / sizeof(int32_t);
-            mutable_frame.audio_data().assign(audio_data, audio_data + num_samples);
+            std::vector<int32_t> audio_vec(audio_data, audio_data + num_samples);
+            mutable_frame.audio_data() = caspar::array<int32_t>(std::move(audio_vec));
         }
 
         frame_ = core::draw_frame(std::move(mutable_frame));
