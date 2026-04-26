@@ -479,24 +479,38 @@ struct replay_producer : public core::frame_producer
         black_frame(buffer1.get(), index_header_->width, index_header_->height, 3);
         std::memcpy(buffer2.get(), buffer1.get(), frame_size);
 
+        *result_audio      = nullptr;
+        *result_audio_size = 0;
+
         int filled = 0;
 
+        // ── Use leftover from previous call ──────────────────────────────────
         if (leftovers_)
         {
             blend_images(leftovers_, buffer1.get(), buffer2.get(),
                          index_header_->width, index_header_->height, 3, 64);
+            std::swap(buffer1, buffer2);
 
-            *result_audio = new int32_t[leftovers_audio_size_ / 4];
-            *result_audio_size = leftovers_audio_size_;
-            std::memcpy(*result_audio, leftovers_audio_, leftovers_audio_size_);
+            // Copy leftover audio as the current result audio
+            if (leftovers_audio_ && leftovers_audio_size_ > 0)
+            {
+                *result_audio      = new int32_t[leftovers_audio_size_ / 4];
+                *result_audio_size = leftovers_audio_size_;
+                std::memcpy(*result_audio, leftovers_audio_, leftovers_audio_size_);
+            }
 
             filled += leftovers_duration_;
-            if (filled > 64)
+
+            if (filled >= 64)
             {
+                // Leftover covers the full output frame
                 leftovers_duration_ = filled - 64;
+                std::memcpy(result, buffer2.get(), frame_size);
+                return true;
             }
             else
             {
+                // Leftover used up — clear it
                 delete[] leftovers_;       leftovers_       = nullptr;
                 delete[] leftovers_audio_; leftovers_audio_ = nullptr;
                 leftovers_duration_   = 0;
@@ -505,12 +519,15 @@ struct replay_producer : public core::frame_producer
         }
 
         int frame_duration = static_cast<int>((1.0f / abs_speed_) * 64.0f);
+        if (frame_duration <= 0) frame_duration = 1;
 
+        // ── Decode frames until output frame is filled ────────────────────────
         while (filled < 64)
         {
             long long field_pos = read_index(in_idx_file_);
             if (field_pos == -1)
             {
+                // EOF
                 if (*result_audio) { delete[] *result_audio; *result_audio = nullptr; }
                 *result_audio_size = 0;
                 return false;
@@ -518,50 +535,70 @@ struct replay_producer : public core::frame_producer
             move_to_next_frame();
             seek_frame(in_file_, field_pos, FILE_BEGIN);
 
-            uint8_t* field = nullptr;
+            uint8_t* field     = nullptr;
             uint32_t fw = 0, fh = 0, audio_sz = 0;
             int32_t* audio_buf = nullptr;
             read_frame(in_file_, &fw, &fh, &field, &audio_sz, &audio_buf);
 
             auto field_guard = std::unique_ptr<uint8_t[]>(field);
+            auto audio_guard = std::unique_ptr<int32_t[]>(audio_buf);
+
+            if (!field_guard)
+                break;
 
             if (interlaced_)
             {
                 auto doubled = std::make_unique<uint8_t[]>(frame_size);
-                field_double(field, doubled.get(),
+                field_double(field_guard.get(), doubled.get(),
                              index_header_->width, index_header_->height, 3);
                 field_guard = std::move(doubled);
-                int drop = (framenum_ % 2 == 0) ? index_header_->width * 3 : 0;
-                std::memcpy(field_guard.get() + drop, field_guard.get() + drop,
-                            frame_size - drop); // noop but left for structural clarity
             }
 
-            uint8_t level = (filled == 0) ? 64
-                          : static_cast<uint8_t>((frame_duration + filled) <= 64
-                                ? frame_duration : 64 - filled);
+            // How much of this frame fits into the output?
+            int remaining   = 64 - filled;
+            int contribution = std::min(frame_duration, remaining);
+            uint8_t level   = static_cast<uint8_t>(contribution);
 
             blend_images(field_guard.get(), buffer2.get(), buffer1.get(),
                          index_header_->width, index_header_->height, 3, level);
+            std::swap(buffer1, buffer2);
 
+            // Use this frame's audio as output audio (last one wins)
             if (*result_audio) delete[] *result_audio;
-            *result_audio      = audio_buf;
-            *result_audio_size = audio_sz;
-
-            delete[] leftovers_;       leftovers_       = nullptr;
-            delete[] leftovers_audio_; leftovers_audio_ = nullptr;
-
-            // Keep field as leftover (release from unique_ptr first)
-            leftovers_       = field_guard.release();
-            leftovers_audio_ = audio_buf;     // shared pointer — do NOT double-free
-            // Note: result_audio points to audio_buf as well; caller frees it
-            leftovers_audio_size_ = audio_sz;
+            if (audio_sz > 0 && audio_guard)
+            {
+                *result_audio      = new int32_t[audio_sz / 4];
+                *result_audio_size = audio_sz;
+                std::memcpy(*result_audio, audio_guard.get(), audio_sz);
+            }
 
             filled += frame_duration;
 
-            std::swap(buffer1, buffer2);
+            // If this frame extends beyond the output — save the excess as leftover
+            if (filled > 64)
+            {
+                leftovers_duration_   = filled - 64;
+                leftovers_audio_size_ = audio_sz;
+
+                // Save pixel leftover
+                delete[] leftovers_;
+                leftovers_ = new uint8_t[frame_size];
+                std::memcpy(leftovers_, field_guard.get(), frame_size);
+
+                // Save audio leftover (separate copy)
+                delete[] leftovers_audio_;
+                if (audio_sz > 0 && audio_guard)
+                {
+                    leftovers_audio_ = new int32_t[audio_sz / 4];
+                    std::memcpy(leftovers_audio_, audio_guard.get(), audio_sz);
+                }
+                else
+                {
+                    leftovers_audio_ = nullptr;
+                }
+            }
         }
 
-        leftovers_duration_ = filled - 64;
         std::memcpy(result, buffer2.get(), frame_size);
         return true;
     }
