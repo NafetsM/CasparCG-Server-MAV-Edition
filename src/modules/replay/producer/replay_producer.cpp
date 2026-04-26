@@ -554,16 +554,28 @@ struct replay_producer : public core::frame_producer
                 field_guard = std::move(doubled);
             }
 
-            // How much of this frame fits into the output?
-            int remaining   = 64 - filled;
-            int contribution = std::min(frame_duration, remaining);
-            uint8_t level   = static_cast<uint8_t>(contribution);
+            // Level berechnung exakt wie im Original:
+            // filled==0: erster Frame → volle Gewichtung (64)
+            // sonst: wie viel vom Frame noch in den Output-Slot passt
+            uint8_t level;
+            if (filled == 0)
+                level = 64;
+            else
+                level = static_cast<uint8_t>((frame_duration + filled) <= 64
+                            ? frame_duration : 64 - filled);
 
+            // Blend: field → buffer2 → buffer1 (Ergebnis in buffer1)
+            // buffer2 ist der akkumulierte bisherige Output
+            // buffer1 ist das neue Blend-Ziel
             blend_images(field_guard.get(), buffer2.get(), buffer1.get(),
                          index_header_->width, index_header_->height, 3, level);
-            std::swap(buffer1, buffer2);
 
-            // Use this frame's audio as output audio (last one wins)
+            // buffer1 ist jetzt der neue akkumulierte Output → tausche
+            // ABER: Original tauscht NICHT — buffer2 bleibt Output-Buffer
+            // Wir kopieren buffer1 → buffer2 um denselben Effekt zu erzielen
+            std::memcpy(buffer2.get(), buffer1.get(), frame_size);
+
+            // Audio: letzter Frame gewinnt
             if (*result_audio) delete[] *result_audio;
             if (audio_sz > 0 && audio_guard)
             {
@@ -574,18 +586,16 @@ struct replay_producer : public core::frame_producer
 
             filled += frame_duration;
 
-            // If this frame extends beyond the output — save the excess as leftover
+            // Wenn dieser Frame über den Output-Slot hinausgeht → Leftover speichern
             if (filled > 64)
             {
                 leftovers_duration_   = filled - 64;
                 leftovers_audio_size_ = audio_sz;
 
-                // Save pixel leftover
                 delete[] leftovers_;
                 leftovers_ = new uint8_t[frame_size];
                 std::memcpy(leftovers_, field_guard.get(), frame_size);
 
-                // Save audio leftover (separate copy)
                 delete[] leftovers_audio_;
                 if (audio_sz > 0 && audio_guard)
                 {
