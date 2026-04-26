@@ -487,11 +487,10 @@ struct replay_producer : public core::frame_producer
         // ── Use leftover from previous call ──────────────────────────────────
         if (leftovers_)
         {
+            // blend_images: max level = 63 (= 100% src1)
             blend_images(leftovers_, buffer1.get(), buffer2.get(),
-                         index_header_->width, index_header_->height, 3, 64);
-            std::swap(buffer1, buffer2);
+                         index_header_->width, index_header_->height, 3, 63);
 
-            // Copy leftover audio as the current result audio
             if (leftovers_audio_ && leftovers_audio_size_ > 0)
             {
                 *result_audio      = new int32_t[leftovers_audio_size_ / 4];
@@ -503,14 +502,12 @@ struct replay_producer : public core::frame_producer
 
             if (filled >= 64)
             {
-                // Leftover covers the full output frame
                 leftovers_duration_ = filled - 64;
                 std::memcpy(result, buffer2.get(), frame_size);
                 return true;
             }
             else
             {
-                // Leftover used up — clear it
                 delete[] leftovers_;       leftovers_       = nullptr;
                 delete[] leftovers_audio_; leftovers_audio_ = nullptr;
                 leftovers_duration_   = 0;
@@ -554,26 +551,20 @@ struct replay_producer : public core::frame_producer
                 field_guard = std::move(doubled);
             }
 
-            // Level berechnung exakt wie im Original:
-            // filled==0: erster Frame → volle Gewichtung (64)
+            // Level berechnung exakt wie im Original (max level = 63):
+            // filled==0: erster Frame → volle Gewichtung (63)
             // sonst: wie viel vom Frame noch in den Output-Slot passt
             uint8_t level;
             if (filled == 0)
-                level = 64;
+                level = 63;
             else
                 level = static_cast<uint8_t>((frame_duration + filled) <= 64
                             ? frame_duration : 64 - filled);
 
-            // Blend: field → buffer2 → buffer1 (Ergebnis in buffer1)
-            // buffer2 ist der akkumulierte bisherige Output
-            // buffer1 ist das neue Blend-Ziel
-            blend_images(field_guard.get(), buffer2.get(), buffer1.get(),
+            // blend_images(src1=neuer Frame, src2=bisheriger Blend, dst=Ergebnis)
+            // Ergebnis landet in buffer2 (wie im Original)
+            blend_images(field_guard.get(), buffer2.get(), buffer2.get(),
                          index_header_->width, index_header_->height, 3, level);
-
-            // buffer1 ist jetzt der neue akkumulierte Output → tausche
-            // ABER: Original tauscht NICHT — buffer2 bleibt Output-Buffer
-            // Wir kopieren buffer1 → buffer2 um denselben Effekt zu erzielen
-            std::memcpy(buffer2.get(), buffer1.get(), frame_size);
 
             // Audio: letzter Frame gewinnt
             if (*result_audio) delete[] *result_audio;
