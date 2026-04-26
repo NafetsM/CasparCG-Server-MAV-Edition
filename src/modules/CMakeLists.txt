@@ -18,3 +18,4 @@ if (MSVC)
 	add_subdirectory(bluefish)
 endif()
 
+add_subdirectory(replay)

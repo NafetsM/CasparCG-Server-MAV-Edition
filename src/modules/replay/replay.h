@@ -1,0 +1,25 @@
+/*
+* Copyright (c) 2011 Sveriges Television AB <info@casparcg.com>
+* Copyright (c) 2013 Technical University of Lodz Multimedia Centre <office@cm.p.lodz.pl>
+*
+* This file is part of CasparCG (www.casparcg.com).
+*
+* CasparCG is free software: you can redistribute it and/or modify
+* it under the terms of the GNU General Public License as published by
+* the Free Software Foundation, either version 3 of the License, or
+* (at your option) any later version.
+*
+* Author: Jan Starzak, jan@ministryofgoodsteps.com
+*         Krzysztof Pyrkosz, pyrkosz@o2.pl
+*         Ported to CasparCG 2.5 by [your name]
+*/
+
+#pragma once
+
+#include <core/module_dependencies.h>
+
+namespace caspar { namespace replay {
+
+    void init(core::module_dependencies dependencies);
+
+}} // namespace caspar::replay
