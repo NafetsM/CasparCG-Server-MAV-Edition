@@ -537,7 +537,7 @@ long long write_frame(mjpeg_file_handle  outfile,
         else // LOWER
             src_line = cinfo.next_scanline * 2 + 1;
 
-        row[0] = reinterpret_cast<JSAMPROW>(image + src_line * row_stride);
+        row[0] = reinterpret_cast<JSAMPROW>(const_cast<uint8_t*>(image) + src_line * row_stride);
         jpeg_write_scanlines(&cinfo, row, 1);
     }
 

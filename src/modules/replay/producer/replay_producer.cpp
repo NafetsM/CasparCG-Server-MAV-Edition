@@ -247,13 +247,12 @@ struct replay_producer : public core::frame_producer
                                 uint32_t       audio_data_length = 0)
     {
         // CasparCG 2.5 native format is BGRA (4 bytes per pixel)
-        // The JPEG decoder gives us RGB (3 bytes), so we convert here
         core::pixel_format_desc desc(core::pixel_format::bgra);
         desc.planes.push_back(core::pixel_format_desc::plane(width, height, 4));
-        auto frame = frame_factory_->create_frame(this, desc);
+        auto mutable_frame = frame_factory_->create_frame(this, desc);
 
         // Convert RGB → BGRA
-        auto* dst = frame.image_data(0).begin();
+        auto* dst = mutable_frame.image_data(0).begin();
         for (uint32_t i = 0; i < width * height; ++i)
         {
             dst[i * 4 + 0] = frame_data[i * 3 + 2]; // B
@@ -265,10 +264,10 @@ struct replay_producer : public core::frame_producer
         if (audio_ && audio_data_length > 0 && audio_data)
         {
             auto num_samples = audio_data_length / sizeof(int32_t);
-            frame.audio_data().assign(audio_data, audio_data + num_samples);
+            mutable_frame.audio_data().assign(audio_data, audio_data + num_samples);
         }
 
-        frame_ = core::draw_frame(std::move(frame));
+        frame_ = core::draw_frame(std::move(mutable_frame));
         return frame_;
     }
 
@@ -706,8 +705,8 @@ struct replay_producer : public core::frame_producer
 
     // ── frame_producer interface ──────────────────────────────────────────────
 
-    core::draw_frame receive_impl(const core::video_format_desc& /*fmt*/,
-                                  int                            /*nb_samples*/) override
+    core::draw_frame receive_impl(const core::video_field /*field*/,
+                                  int                    /*nb_samples*/) override
     {
         std::lock_guard<std::mutex> lock(frame_buffer_mutex_);
         if (frame_buffer_.empty())
@@ -725,7 +724,7 @@ struct replay_producer : public core::frame_producer
         return frm;
     }
 
-    core::draw_frame last_frame() override
+    core::draw_frame last_frame(const core::video_field /*field*/) override
     {
         return core::draw_frame::still(last_frame_);
     }
@@ -742,6 +741,8 @@ struct replay_producer : public core::frame_producer
         return std::numeric_limits<uint32_t>::max();
     }
 #pragma warning(default:4244)
+
+    bool is_ready() override { return true; }
 
     std::wstring print() const override
     {

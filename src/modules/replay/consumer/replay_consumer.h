@@ -10,6 +10,7 @@
 #include <common/memory.h>
 #include <core/fwd.h>
 #include <core/consumer/frame_consumer.h>
+#include <core/consumer/channel_info.h>
 
 #include <vector>
 #include <string>
@@ -17,8 +18,9 @@
 namespace caspar { namespace replay {
 
 spl::shared_ptr<core::frame_consumer> create_consumer(
-    const std::vector<std::wstring>&                   params,
-    std::vector<spl::shared_ptr<core::video_channel>>  channels,
-    const core::video_format_repository&               format_repository);
+    const std::vector<std::wstring>&                         params,
+    const core::video_format_repository&                     format_repository,
+    const std::vector<spl::shared_ptr<core::video_channel>>  channels,
+    const core::channel_info&                                channel_info);
 
 }} // namespace caspar::replay

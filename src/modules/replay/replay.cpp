@@ -77,7 +77,7 @@ std::wstring detect_libjpeg_version()
 void init(core::module_dependencies dependencies)
 {
     dependencies.consumer_registry->register_consumer_factory(
-        L"Replay Consumer", create_consumer, nullptr);
+        L"Replay Consumer", create_consumer);
 
     dependencies.producer_registry->register_producer_factory(
         L"Replay Producer", create_producer, create_thumbnail);

@@ -12,6 +12,7 @@
 
 #include <core/frame/frame.h>
 #include <core/consumer/frame_consumer.h>
+#include <core/consumer/channel_info.h>
 #include <core/video_format.h>
 #include <core/monitor/monitor.h>
 
@@ -85,8 +86,8 @@ public:
 
     // CasparCG 2.5 signature
     void initialize(const core::video_format_desc& format_desc,
-                    const core::audio_channel_layout& /*channel_layout*/,
-                    int /*channel_index*/) override
+                    const core::channel_info& /*channel_info*/,
+                    int /*port_index*/) override
     {
         format_desc_ = format_desc;
 
@@ -116,7 +117,7 @@ public:
                            format_desc_.audio_channels);
     }
 
-    std::future<bool> send(core::const_frame frame) override
+    std::future<bool> send(const core::video_field /*field*/, core::const_frame frame) override
     {
         if (!file_open_)
             return make_ready_future(true);
@@ -195,9 +196,10 @@ private:
 // ── Factory ───────────────────────────────────────────────────────────────────
 
 spl::shared_ptr<core::frame_consumer> create_consumer(
-    const std::vector<std::wstring>&                  params,
-    std::vector<spl::shared_ptr<core::video_channel>> channels,
-    const core::video_format_repository&              /*format_repository*/)
+    const std::vector<std::wstring>&                          params,
+    const core::video_format_repository&                      /*format_repository*/,
+    const std::vector<spl::shared_ptr<core::video_channel>>  /*channels*/,
+    const core::channel_info&                                 /*channel_info*/)
 {
     if (params.empty() || !boost::iequals(params[0], L"REPLAY"))
         return core::frame_consumer::empty();
