@@ -13,6 +13,7 @@
 #include <core/frame/draw_frame.h>
 #include <core/frame/pixel_format.h>
 #include <core/frame/frame_factory.h>
+#include <core/frame/frame.h>
 #include <core/video_format.h>
 #include <core/monitor/monitor.h>
 
@@ -249,7 +250,7 @@ struct replay_producer : public core::frame_producer
         // CasparCG 2.5 native format is BGRA (4 bytes per pixel)
         core::pixel_format_desc desc(core::pixel_format::bgra);
         desc.planes.push_back(core::pixel_format_desc::plane(width, height, 4));
-        auto mutable_frame = frame_factory_->create_frame(this, desc);
+        core::mutable_frame mutable_frame = frame_factory_->create_frame(this, desc);
 
         // Convert RGB → BGRA
         auto* dst = mutable_frame.image_data(0).begin();

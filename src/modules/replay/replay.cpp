@@ -80,7 +80,7 @@ void init(core::module_dependencies dependencies)
         L"Replay Consumer", create_consumer);
 
     dependencies.producer_registry->register_producer_factory(
-        L"Replay Producer", create_producer, create_thumbnail);
+        L"Replay Producer", create_producer);
 
     CASPAR_LOG(info) << L"[replay] JPEG lib version: " << detect_libjpeg_version();
 }
