@@ -98,7 +98,7 @@ struct replay_producer : public core::frame_producer
         uint64_t            start_frame,
         uint64_t            last_frame_count,
         float               start_speed,
-        int                 audio = 0)
+        int                 audio = -1) // -1 = auto, 0 = forced off, 1 = forced on
         : filename_(filename)
         , frame_factory_(frame_factory)
     {
@@ -146,21 +146,35 @@ struct replay_producer : public core::frame_producer
             mjpeg_file_header_ex* hdr_ex = nullptr;
             if (index_header_->version >= 2)
             {
-                read_index_header_ex(in_idx_file_, &hdr_ex);
+                read_index_header_ex(in_idx_file_, index_header_->version, &hdr_ex);
                 index_header_ex_ = spl::shared_ptr<mjpeg_file_header_ex>(hdr_ex);
-                CASPAR_LOG(info) << print() << L" Audio channels: "
-                                 << index_header_ex_->audio_channels;
+                CASPAR_LOG(info) << print() << L" Audio: "
+                                 << index_header_ex_->audio_channels << L" channels @ "
+                                 << index_header_ex_->audio_sample_rate << L" Hz";
+
+                if (index_header_->version != MJPEG_FILE_VERSION)
+                {
+                    CASPAR_LOG(warning) << print()
+                        << L" File version " << static_cast<int>(index_header_->version)
+                        << L" differs from current " << static_cast<int>(MJPEG_FILE_VERSION)
+                        << L" — index seeks may be incorrect.";
+                }
             }
             else
             {
                 hdr_ex = new mjpeg_file_header_ex{};
-                hdr_ex->audio_channels = 0;
+                hdr_ex->audio_channels    = 0;
+                hdr_ex->audio_sample_rate = 48000;
                 index_header_ex_ = spl::shared_ptr<mjpeg_file_header_ex>(hdr_ex);
             }
         }
 
         interlaced_ = (index_header_->field_mode != 3);
-        audio_      = audio;
+        // audio == -1 → auto-enable when file has audio channels.
+        // audio ==  0 → user explicitly disabled.
+        // audio ==  1 → user explicitly enabled.
+        audio_      = (audio < 0) ? (index_header_ex_->audio_channels > 0 ? 1 : 0)
+                                  : audio;
 
         set_playback_speed(start_speed);
 
@@ -444,30 +458,6 @@ struct replay_producer : public core::frame_producer
             CASPAR_LOG(error) << L"[replay] move_to_next_frame: seek_index failed";
     }
 
-    void sync_to_frame()
-    {
-        if (!interlaced_ || framenum_ % 2 == 0) return;
-
-        if (framenum_ + 1 >= real_last_framenum_)
-        {
-            seek_index(in_idx_file_, -1, FILE_CURRENT);
-            --framenum_;
-        }
-        else
-        {
-            read_index(in_idx_file_);
-            ++framenum_;
-        }
-    }
-
-    void proper_interlace(const mmx_uint8_t* f1, const mmx_uint8_t* f2, mmx_uint8_t* dst)
-    {
-        if (index_header_->field_mode == 1) // lower field first
-            interlace_fields(f2, f1, dst, index_header_->width, index_header_->height, 3);
-        else
-            interlace_fields(f1, f2, dst, index_header_->width, index_header_->height, 3);
-    }
-
 #pragma warning(disable:4244)
     bool slow_motion_playback(uint8_t*  result,
                               int32_t** result_audio,
@@ -546,8 +536,10 @@ struct replay_producer : public core::frame_producer
             if (interlaced_)
             {
                 auto doubled = std::make_unique<uint8_t[]>(frame_size);
-                field_double(field_guard.get(), doubled.get(),
-                             index_header_->width, index_header_->height, 3);
+                // Use line-doubling so both even- and odd-row extractions by
+                // the channel mixer yield the field data unchanged.
+                line_double(field_guard.get(), doubled.get(),
+                            index_header_->width, index_header_->height, 3);
                 field_guard = std::move(doubled);
             }
 
@@ -619,57 +611,35 @@ struct replay_producer : public core::frame_producer
 
         seeked_ = false;
 
-        bool slow = (abs_speed_ > 0.0f && std::fmod(abs_speed_, 1.0f) != 0.0f);
+        const uint32_t full_w  = index_header_->width;
+        const uint32_t full_h  = index_header_->height;
+        const uint32_t full_sz = full_w * full_h * 3;
 
+        const bool slow = (abs_speed_ > 0.0f && std::fmod(abs_speed_, 1.0f) != 0.0f);
+
+        // ── Slow motion ───────────────────────────────────────────────────────
+        // slow_motion_playback returns one rendered field worth of data
+        // (already field-doubled to full size for interlaced files).
         if (slow)
         {
-            uint32_t frame_size = index_header_->width * index_header_->height * 3;
-            auto field1 = std::make_unique<uint8_t[]>(frame_size);
-            int32_t* audio1 = nullptr; uint32_t audio1_sz = 0;
+            auto rendered = std::make_unique<uint8_t[]>(full_sz);
+            int32_t* audio = nullptr; uint32_t audio_sz = 0;
 
-            if (!slow_motion_playback(field1.get(), &audio1, &audio1_sz))
+            if (!slow_motion_playback(rendered.get(), &audio, &audio_sz))
                 return { frame_, framenum_ };
 
-            auto audio1_guard = std::unique_ptr<int32_t[]>(audio1);
-
-            if (!interlaced_)
-            {
-                make_frame(field1.get(), frame_size,
-                           index_header_->width, index_header_->height,
-                           audio1, audio1_sz);
-                frame_stable_ = true;
-                return { frame_, framenum_ };
-            }
-
-            auto field2 = std::make_unique<uint8_t[]>(frame_size);
-            int32_t* audio2 = nullptr; uint32_t audio2_sz = 0;
-
-            if (!slow_motion_playback(field2.get(), &audio2, &audio2_sz))
-            {
-                make_frame(field1.get(), frame_size,
-                           index_header_->width, index_header_->height,
-                           audio1, audio1_sz);
-                frame_stable_ = true;
-                return { frame_, framenum_ };
-            }
-
-            auto audio2_guard = std::unique_ptr<int32_t[]>(audio2);
-            uint32_t total_audio = audio1_sz + audio2_sz;
-            auto audio_combined = std::make_unique<int32_t[]>(total_audio / 4);
-            std::memcpy(audio_combined.get(),                   audio1, audio1_sz);
-            std::memcpy(audio_combined.get() + audio1_sz / 4,  audio2, audio2_sz);
-
-            auto full_frame = std::make_unique<uint8_t[]>(frame_size);
-            interlace_frames(field1.get(), field2.get(), full_frame.get(),
-                             index_header_->width, index_header_->height, 3);
-            make_frame(full_frame.get(), frame_size,
-                       index_header_->width, index_header_->height,
-                       audio_combined.get(), total_audio);
+            auto audio_guard = std::unique_ptr<int32_t[]>(audio);
+            make_frame(rendered.get(), full_sz, full_w, full_h, audio, audio_sz);
             frame_stable_ = false;
             return { frame_, framenum_ };
         }
 
-        // ── Normal / fast playback ─────────────────────────────────────────────
+        // ── Normal / fast playback ────────────────────────────────────────────
+        // One .mav entry per call — for interlaced files the entry is one field
+        // (half height); the channel mixer for a 1080i50 output extracts
+        // alternate rows so a line-doubled field placed in a full-height frame
+        // is correctly seen as the right field, regardless of which row set the
+        // mixer pulls.
 
         if (leftovers_)
         {
@@ -678,69 +648,37 @@ struct replay_producer : public core::frame_producer
             leftovers_audio_size_ = 0;
         }
 
-        if (abs_speed_ >= 1.0f)
-            sync_to_frame();
-
-        long long field1_pos = read_index(in_idx_file_);
-        if (field1_pos == -1)
+        long long field_pos = read_index(in_idx_file_);
+        if (field_pos == -1)
             return { frame_, framenum_ };
 
         move_to_next_frame();
-        seek_frame(in_file_, field1_pos, FILE_BEGIN);
+        seek_frame(in_file_, field_pos, FILE_BEGIN);
 
-        uint8_t* field1 = nullptr;
-        uint32_t fw = 0, fh = 0, audio1_sz = 0;
-        int32_t* audio1 = nullptr;
-        uint32_t field1_size = read_frame(in_file_, &fw, &fh, &field1, &audio1_sz, &audio1);
+        uint8_t* field = nullptr;
+        uint32_t fw = 0, fh = 0, audio_sz = 0;
+        int32_t* audio = nullptr;
+        uint32_t field_size = read_frame(in_file_, &fw, &fh, &field, &audio_sz, &audio);
 
-        auto field1_guard  = std::unique_ptr<uint8_t[]>(field1);
-        auto audio1_guard  = std::unique_ptr<int32_t[]>(audio1);
+        auto field_guard = std::unique_ptr<uint8_t[]>(field);
+        auto audio_guard = std::unique_ptr<int32_t[]>(audio);
 
-        if (!field1)
+        if (!field)
             return { frame_, framenum_ };
 
         if (!interlaced_)
         {
-            make_frame(field1, field1_size, fw, fh, audio1, audio1_sz);
-            frame_stable_ = true;
+            // Progressive file: JPEG entry already covers the full frame.
+            make_frame(field, field_size, fw, fh, audio, audio_sz);
+            frame_stable_ = (speed_ == 0.0f || eof);
             return { frame_, framenum_ };
         }
 
-        // Paused or EOF + interlaced → field double
-        if ((speed_ == 0.0f || eof) && interlaced_)
-        {
-            auto full = std::make_unique<uint8_t[]>(field1_size * 2);
-            field_double(field1, full.get(), fw, fh, 3);
-            make_frame(full.get(), field1_size * 2, fw, fh);
-            frame_stable_ = true;
-            return { frame_, framenum_ };
-        }
-
-        long long field2_pos = read_index(in_idx_file_);
-        move_to_next_frame();
-        seek_frame(in_file_, field2_pos, FILE_BEGIN);
-
-        uint8_t* field2 = nullptr;
-        uint32_t audio2_sz = 0;
-        int32_t* audio2 = nullptr;
-        uint32_t field2_size = read_frame(in_file_, &fw, &fh, &field2, &audio2_sz, &audio2);
-
-        auto field2_guard = std::unique_ptr<uint8_t[]>(field2);
-        auto audio2_guard = std::unique_ptr<int32_t[]>(audio2);
-
-        if (!field2)
-            return { frame_, framenum_ };
-
-        uint32_t total_audio = audio1_sz + audio2_sz;
-        auto audio_combined = std::make_unique<int32_t[]>(total_audio / 4);
-        std::memcpy(audio_combined.get(),                   audio1, audio1_sz);
-        std::memcpy(audio_combined.get() + audio1_sz / 4,  audio2, audio2_sz);
-
-        auto full_frame = std::make_unique<uint8_t[]>(field1_size + field2_size);
-        proper_interlace(field1, field2, full_frame.get());
-        make_frame(full_frame.get(), field1_size + field2_size, fw, fh,
-                   audio_combined.get(), total_audio);
-        frame_stable_ = false;
+        // Interlaced file: line-double the half-height field into a full frame.
+        auto full = std::make_unique<uint8_t[]>(full_sz);
+        line_double(field, full.get(), full_w, full_h, 3);
+        make_frame(full.get(), full_sz, full_w, full_h, audio, audio_sz);
+        frame_stable_ = (speed_ == 0.0f || eof);
         return { frame_, framenum_ };
     }
 
@@ -775,8 +713,9 @@ struct replay_producer : public core::frame_producer
     {
         if (last_framenum_ > 0 && speed_ != 0.0f)
         {
+            // framenum_ counts .mav entries; receive_impl pops one per call.
+            // For interlaced files this means one entry per channel field tick.
             uint64_t span = last_framenum_ - first_framenum_;
-            if (interlaced_) span /= 2;
             return static_cast<uint32_t>(span / speed_);
         }
         return std::numeric_limits<uint32_t>::max();
@@ -831,7 +770,7 @@ spl::shared_ptr<core::frame_producer> create_producer(
         return core::frame_producer::empty();
 
     int      sign        = 0;
-    int      audio       = 0;
+    int      audio       = -1; // -1 = auto (enable when file has audio)
     uint64_t start_frame = 0;
     uint64_t last_frame  = 0;
     float    start_speed = 1.0f;

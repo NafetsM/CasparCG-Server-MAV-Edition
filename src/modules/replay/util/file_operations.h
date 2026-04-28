@@ -75,21 +75,24 @@ namespace caspar { namespace replay {
 struct mjpeg_file_header
 {
     char                        magick[4];      // 'OMAV'
-    uint8_t                     version;        // 1 or 2
+    uint8_t                     version;        // 3 (current)
     uint32_t                    width;
     uint32_t                    height;
-    double                      fps;
-    uint8_t                     field_mode = 3; // 3 = progressive (CasparCG 2.2+)
+    double                      fps;            // fields per second (interlaced) or frames per second (progressive)
+    uint8_t                     field_mode = 3; // 1=lower-first, 2=upper-first, 3=progressive
     boost::posix_time::ptime    begin_timecode;
 };
 
-// Extended header — version 2 only
+// Extended header — version >= 2
 struct mjpeg_file_header_ex
 {
     char    video_fourcc[4];    // 'mjpg'
     char    audio_fourcc[4];    // 'in32'
     int     audio_channels;
+    int     audio_sample_rate;  // Hz (added in v3; v2 files default to 48000)
 };
+
+static constexpr uint8_t MJPEG_FILE_VERSION = 3;
 
 #pragma pack(pop)
 
@@ -129,7 +132,9 @@ void              safe_fclose(mjpeg_file_handle handle);
 void      write_index_header(mjpeg_file_handle idx,
                              const core::video_format_desc* format_desc,
                              boost::posix_time::ptime       start_timecode,
-                             int                            audio_channels);
+                             int                            audio_channels,
+                             int                            audio_sample_rate,
+                             uint8_t                        field_mode);
 
 void      write_index(mjpeg_file_handle idx, long long offset);
 
@@ -139,7 +144,7 @@ long long length_index(mjpeg_file_handle idx);
 int       seek_index(mjpeg_file_handle idx, long long frame, uint32_t origin);
 
 int       read_index_header   (mjpeg_file_handle idx, mjpeg_file_header**    out);
-int       read_index_header_ex(mjpeg_file_handle idx, mjpeg_file_header_ex** out);
+int       read_index_header_ex(mjpeg_file_handle idx, uint8_t version, mjpeg_file_header_ex** out);
 
 // ── Frame (MAV data) operations ───────────────────────────────────────────────
 

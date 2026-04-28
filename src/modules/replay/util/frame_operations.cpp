@@ -49,6 +49,22 @@ void interlace_frames(const mmx_uint8_t* src1, const mmx_uint8_t* src2,
         });
 }
 
+void line_double(const mmx_uint8_t* src, mmx_uint8_t* dst,
+                 uint32_t width, uint32_t height, uint32_t stride)
+{
+    const uint32_t full_row = width * stride;
+    tbb::parallel_for(
+        tbb::blocked_range<uint32_t>(0, height / 2),
+        [=](const tbb::blocked_range<uint32_t>& r)
+        {
+            for (auto i = r.begin(); i != r.end(); ++i)
+            {
+                std::memcpy(dst + (i * 2)     * full_row, src + i * full_row, full_row);
+                std::memcpy(dst + (i * 2 + 1) * full_row, src + i * full_row, full_row);
+            }
+        });
+}
+
 void field_double(const mmx_uint8_t* src, mmx_uint8_t* dst,
                   uint32_t width, uint32_t height, uint32_t stride)
 {

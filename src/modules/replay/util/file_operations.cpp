@@ -85,16 +85,18 @@ void safe_fclose(mjpeg_file_handle handle)
 void write_index_header(mjpeg_file_handle idx,
                         const core::video_format_desc* fmt,
                         boost::posix_time::ptime       start_timecode,
-                        int                            audio_channels)
+                        int                            audio_channels,
+                        int                            audio_sample_rate,
+                        uint8_t                        field_mode)
 {
     mjpeg_file_header hdr{};
     hdr.magick[0] = 'O'; hdr.magick[1] = 'M';
     hdr.magick[2] = 'A'; hdr.magick[3] = 'V';
-    hdr.version        = 2;
+    hdr.version        = MJPEG_FILE_VERSION;
     hdr.width          = fmt->width;
     hdr.height         = fmt->height;
     hdr.fps            = fmt->fps;
-    hdr.field_mode     = 3; // progressive
+    hdr.field_mode     = field_mode;
     hdr.begin_timecode = start_timecode;
 
     DWORD written = 0;
@@ -109,7 +111,8 @@ void write_index_header(mjpeg_file_handle idx,
     hdr_ex.video_fourcc[2] = 'p'; hdr_ex.video_fourcc[3] = 'g';
     hdr_ex.audio_fourcc[0] = 'i'; hdr_ex.audio_fourcc[1] = 'n';
     hdr_ex.audio_fourcc[2] = '3'; hdr_ex.audio_fourcc[3] = '2';
-    hdr_ex.audio_channels  = audio_channels;
+    hdr_ex.audio_channels    = audio_channels;
+    hdr_ex.audio_sample_rate = audio_sample_rate;
 
     written = 0;
 #ifdef REPLAY_IO_WINAPI
@@ -132,16 +135,33 @@ int read_index_header(mjpeg_file_handle idx, mjpeg_file_header** out)
     return 0;
 }
 
-int read_index_header_ex(mjpeg_file_handle idx, mjpeg_file_header_ex** out)
+int read_index_header_ex(mjpeg_file_handle idx, uint8_t version, mjpeg_file_header_ex** out)
 {
     *out = new mjpeg_file_header_ex{};
+    (*out)->audio_sample_rate = 48000; // fallback for v2 files
+
+    // Layout: video_fourcc[4] + audio_fourcc[4] + audio_channels(int) = 12 bytes (v2)
+    //         + audio_sample_rate(int) = 16 bytes (v3)
+    constexpr DWORD V2_SIZE = 4 + 4 + sizeof(int);
+
     DWORD read = 0;
 #ifdef REPLAY_IO_WINAPI
-    ReadFile(idx, *out, sizeof(mjpeg_file_header_ex), &read, nullptr);
+    ReadFile(idx, *out, V2_SIZE, &read, nullptr);
 #else
-    read = static_cast<DWORD>(fread(*out, 1, sizeof(mjpeg_file_header_ex), idx));
+    read = static_cast<DWORD>(fread(*out, 1, V2_SIZE, idx));
 #endif
-    if (read != sizeof(mjpeg_file_header_ex)) { delete *out; return 1; }
+    if (read != V2_SIZE) { delete *out; *out = nullptr; return 1; }
+
+    if (version >= 3)
+    {
+        DWORD r2 = 0;
+#ifdef REPLAY_IO_WINAPI
+        ReadFile(idx, &(*out)->audio_sample_rate, sizeof(int), &r2, nullptr);
+#else
+        r2 = static_cast<DWORD>(fread(&(*out)->audio_sample_rate, 1, sizeof(int), idx));
+#endif
+        if (r2 != sizeof(int)) { delete *out; *out = nullptr; return 1; }
+    }
     return 0;
 }
 
