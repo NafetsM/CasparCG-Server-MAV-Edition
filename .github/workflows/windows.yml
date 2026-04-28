@@ -29,6 +29,13 @@ jobs:
               run: |
                   rm media-scanner/*.zip
 
+            - name: Install JPEG via vcpkg
+              shell: powershell
+              run: |
+                git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+                C:\vcpkg\bootstrap-vcpkg.bat
+                C:\vcpkg\vcpkg install libjpeg-turbo:x64-windows
+
             - name: Run build
               run: |
                   ./tools/windows/build.bat

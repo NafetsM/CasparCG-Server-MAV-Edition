@@ -18,7 +18,7 @@ call "%BUILD_VCVARSALL%" amd64 || goto :error
 
 :: Run cmake
 cd dist || goto :error
-cmake -G "Visual Studio 17 2022" -A x64 ..\src || goto :error
+cmake -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake ..\src || goto :error
 
 :: Build with MSBuild
 echo Building...

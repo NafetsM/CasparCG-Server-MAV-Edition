@@ -117,9 +117,14 @@ public:
                            format_desc_.audio_channels);
     }
 
-    std::future<bool> send(const core::video_field /*field*/, core::const_frame frame) override
+    std::future<bool> send(const core::video_field field, core::const_frame frame) override
     {
         if (!file_open_)
+            return make_ready_future(true);
+
+        // In CasparCG 2.5 progressive video sends field::a and field::b per frame.
+        // Audio is only present on field::a — skip field::b entirely.
+        if (field == core::video_field::b)
             return make_ready_future(true);
 
         if (encode_executor_.size() < encode_executor_.capacity())
