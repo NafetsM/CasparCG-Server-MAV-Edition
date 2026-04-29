@@ -257,17 +257,15 @@ spl::shared_ptr<core::frame_consumer> create_consumer(
     const std::vector<spl::shared_ptr<core::video_channel>>  /*channels*/,
     const core::channel_info&                                 /*channel_info*/)
 {
-    if (params.empty() || !boost::iequals(params[0], L"REPLAY"))
+    if (params.size() < 2 || !boost::iequals(params[0], L"REPLAY"))
         return core::frame_consumer::empty();
 
-    std::wstring        filename    = L"REPLAY";
+    std::wstring        filename    = params[1];
     short               quality     = REPLAY_JPEG_QUALITY;
     chroma_subsampling  subsampling = REPLAY_JPEG_SUBSAMPLING;
 
-    if (params.size() > 1)
+    if (params.size() > 2)
     {
-        filename = params[1];
-
         for (std::size_t i = 2; i < params.size(); ++i)
         {
             if (boost::iequals(params[i], L"SUBSAMPLING") && i + 1 < params.size())

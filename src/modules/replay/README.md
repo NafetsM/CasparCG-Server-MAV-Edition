@@ -1,96 +1,96 @@
 # Replay Module (MAV)
 
-Sport-Replay-Modul für CasparCG 2.5. Nimmt einen Channel als Motion-JPEG-Stream
-(`.mav` + `.idx`) auf und kann ihn mit variabler Geschwindigkeit, vor- und
-rückwärts wiedergeben — ohne dass die Aufnahme dafür gestoppt werden muss
-(Live-Replay).
+Sport-replay module for CasparCG 2.5. Records a channel as a Motion-JPEG stream
+(`.mav` + `.idx`) and plays it back at variable speed, forward and backward —
+without stopping the recording (live replay).
 
-Portiert aus dem ursprünglichen CasparCG-2.0/2.2-Replay-Modul von TU Lodz und
-auf die CasparCG-2.5-Architektur (BGRA, neue `frame_consumer`/`frame_producer`-Signaturen)
-angepasst.
+Ported from the original CasparCG 2.0/2.2 replay module by TU Lodz and
+adapted to the CasparCG 2.5 architecture (BGRA, updated `frame_consumer`/`frame_producer` signatures).
 
-## Dateiformat
+## File Format
 
-Eine Aufnahme besteht aus zwei Dateien im `media/`-Ordner:
+A recording consists of two files in the `media/` folder:
 
-| Datei            | Inhalt                                              |
-| ---------------- | --------------------------------------------------- |
-| `<name>.mav`     | Sequenz aus `[audio_size:u32][audio:int32 LE][JPEG]` pro Eintrag |
-| `<name>.idx`     | Header + 64-Bit-Offset jedes Eintrags in `.mav`     |
+| File             | Contents                                                       |
+| ---------------- | -------------------------------------------------------------- |
+| `<name>.mav`     | Sequence of `[audio_size:u32][audio:int32 LE][JPEG]` per entry |
+| `<name>.idx`     | Header + 64-bit offset of each entry in `.mav`                 |
 
-**Aktuelle Version:** 3 (Stand 2026-04-28)
+**Current version:** 3 (as of 2026-04-28)
 
-Header-Layout (`mjpeg_file_header` + `mjpeg_file_header_ex`):
+Header layout (`mjpeg_file_header` + `mjpeg_file_header_ex`):
 
 ```
 magick[4]            = 'OMAV'
 version              = 3
-width, height        = volle Frame-Größe (auch bei interlaced)
-fps                  = Felder/s (interlaced) bzw. Frames/s (progressive)
+width, height        = full frame size (also for interlaced)
+fps                  = fields/s (interlaced) or frames/s (progressive)
 field_mode           = 1 (lower-first), 2 (upper-first), 3 (progressive)
-begin_timecode       = UTC-Zeit beim Start
+begin_timecode       = UTC time at start
 video_fourcc[4]      = 'mjpg'
 audio_fourcc[4]      = 'in32'
-audio_channels       = z.B. 16
-audio_sample_rate    = Hz, z.B. 48000   (NEU in v3)
+audio_channels       = e.g. 16
+audio_sample_rate    = Hz, e.g. 48000   (new in v3)
 ```
 
-Bei **interlaced** Aufnahmen enthält jeder MAV-Eintrag genau **ein Halbbild**
-(JPEG mit halber Höhe, z.B. 1920×540 für 1080i50). Zwei aufeinanderfolgende
-Einträge ergeben ein Vollbild.
-Bei **progressive** ist jeder Eintrag ein Vollbild.
+For **interlaced** recordings each MAV entry contains exactly **one field**
+(JPEG at half height, e.g. 1920×540 for 1080i50). Two consecutive entries make one full frame.
+For **progressive** recordings each entry is a full frame.
 
-## AMCP-Befehle
+## AMCP Commands
 
-### Aufnahme — Consumer
+### Recording — Consumer
 
 ```text
 ADD <channel> REPLAY <filename> [QUALITY <q>] [SUBSAMPLING 444|422|420|411]
 REMOVE <channel> <consumer-index>
 ```
 
-| Parameter      | Default | Beschreibung                                   |
-| -------------- | ------- | ---------------------------------------------- |
-| `<filename>`   | REPLAY  | Basisname (ohne `.mav`/`.idx`), unter `media/` |
-| `QUALITY`      | 90      | JPEG-Qualität 1–100                            |
-| `SUBSAMPLING`  | 422     | Chroma-Subsampling                             |
+| Parameter      | Default | Description                                             |
+| -------------- | ------- | ------------------------------------------------------- |
+| `<filename>`   | —       | Base name (without `.mav`/`.idx`), stored under `media/`. **Required** — the command is rejected if omitted. |
+| `QUALITY`      | 90      | JPEG quality 1–100                                      |
+| `SUBSAMPLING`  | 422     | Chroma subsampling                                      |
 
-Felder-/Sample-Rate werden automatisch aus dem `video_format_desc` des Channels
-übernommen. Bei interlaced Channels (z.B. 1080i50) speichert der Consumer beide
-Halbbilder einzeln und behält die Audio-Information beider Felder.
+> **Note:** `<filename>` is mandatory. `ADD <channel> REPLAY` without a filename
+> is silently ignored — no consumer is created.
 
-**Beispiele**
+Field order and sample rate are taken automatically from the channel's `video_format_desc`.
+For interlaced channels (e.g. 1080i50) the consumer stores both fields individually
+and preserves the audio data of each field.
+
+**Examples**
 
 ```text
-ADD 1 REPLAY TEST3                              # Standard
-ADD 1 REPLAY MATCH SUBSAMPLING 444 QUALITY 95   # Hochqualitativ
-REMOVE 1 150                                    # Index 150 = Replay-Consumer
+ADD 1 REPLAY TEST3                              # standard
+ADD 1 REPLAY MATCH SUBSAMPLING 444 QUALITY 95   # high quality
+REMOVE 1 150                                    # index 150 = replay consumer
 ```
 
-### Wiedergabe — Producer
+### Playback — Producer
 
 ```text
 PLAY <channel>-<layer> <filename> [SEEK [|]<n>] [SPEED <s>] [LENGTH <n>] [AUDIO 0|1]
 ```
 
-| Parameter | Default          | Beschreibung                                                    |
-| --------- | ---------------- | --------------------------------------------------------------- |
-| `SEEK`    | `0` (= Anfang)   | Frame-Position. `\|<n>` = `<n>` Frames vor dem aktuellen Ende.  |
-| `SPEED`   | `1.0`            | Geschwindigkeit. Negativ = rückwärts. `0` = pausiert.           |
-| `LENGTH`  | `0` (= unendlich)| Maximale Anzahl wiederzugebender Frames                         |
-| `AUDIO`   | auto             | `1` = Audio aktiv, `0` = Stumm. Default: aktiv, falls Datei Audiokanäle hat. |
+| Parameter | Default           | Description                                                         |
+| --------- | ----------------- | ------------------------------------------------------------------- |
+| `SEEK`    | `0` (= beginning) | Frame position. `\|<n>` = `<n>` frames before the current live end. |
+| `SPEED`   | `1.0`             | Playback speed. Negative = reverse. `0` = paused.                   |
+| `LENGTH`  | `0` (= unlimited) | Maximum number of frames to play                                    |
+| `AUDIO`   | auto              | `1` = audio on, `0` = muted. Default: on if the file has audio channels. |
 
-**Beispiele**
+**Examples**
 
 ```text
-PLAY 1-1 TEST3                          # Audio automatisch an wenn vorhanden
-PLAY 1-1 TEST3 SPEED 0.25               # Vierfach-Slow-Motion
-PLAY 1-1 TEST3 SPEED -1                 # Rückwärts
-PLAY 1-1 TEST3 SEEK |100                # Start 100 Frames vor dem Live-Ende
-PLAY 1-1 TEST3 LENGTH 250 AUDIO 0       # 10 Sekunden bei 25fps, stumm
+PLAY 1-1 TEST3                          # audio on automatically if present
+PLAY 1-1 TEST3 SPEED 0.25               # quarter-speed slow motion
+PLAY 1-1 TEST3 SPEED -1                 # reverse playback
+PLAY 1-1 TEST3 SEEK |100                # start 100 frames before live end
+PLAY 1-1 TEST3 LENGTH 250 AUDIO 0       # 10 seconds at 25 fps, muted
 ```
 
-### Steuerung während der Wiedergabe — `CALL`
+### Control During Playback — `CALL`
 
 ```text
 CALL <channel>-<layer> SPEED <s>
@@ -100,42 +100,42 @@ CALL <channel>-<layer> LENGTH <n>
 CALL <channel>-<layer> AUDIO 0|1
 ```
 
-| Befehl              | Wirkung                                                 |
-| ------------------- | ------------------------------------------------------- |
-| `SPEED <s>`         | Geschwindigkeit umsetzen (gleiche Semantik wie `PLAY`)  |
-| `PAUSE`             | Setzt die Geschwindigkeit auf `0`                       |
-| `SEEK <n>`          | Absolute Position (Frame `n`)                           |
-| `SEEK +<n>`         | `n` Frames vorwärts                                     |
-| `SEEK -<n>`         | `n` Frames rückwärts                                    |
-| `SEEK \|<n>`        | `n` Frames vor dem aktuellen Live-Ende                  |
-| `LENGTH <n>`        | Maximale Wiedergabelänge ändern (`0` = unendlich)       |
-| `AUDIO 0` / `AUDIO 1` | Audio während der Wiedergabe aus- / einschalten       |
+| Command               | Effect                                                     |
+| --------------------- | ---------------------------------------------------------- |
+| `SPEED <s>`           | Change speed (same semantics as `PLAY`)                    |
+| `PAUSE`               | Set speed to `0`                                           |
+| `SEEK <n>`            | Absolute position (frame `n`)                              |
+| `SEEK +<n>`           | `n` frames forward                                         |
+| `SEEK -<n>`           | `n` frames backward                                        |
+| `SEEK \|<n>`          | `n` frames before the current live end                     |
+| `LENGTH <n>`          | Change maximum playback length (`0` = unlimited)           |
+| `AUDIO 0` / `AUDIO 1` | Mute / unmute audio during playback                       |
 
-## Live-Replay-Workflow
+## Live Replay Workflow
 
 ```text
-# 1) Aufnahme starten (z.B. auf Channel 1)
+# 1) Start recording (e.g. on channel 1)
 ADD 1 REPLAY MATCH
 
-# 2) Auf einem zweiten Channel oder Layer abspielen
+# 2) Play back on a second channel or layer
 PLAY 2-1 MATCH SPEED 0.5 SEEK |200
 
-# 3) Während der Wiedergabe auf eine andere Stelle springen
+# 3) Jump to a different position during playback
 CALL 2-1 SEEK |400
 
-# 4) Aufnahme stoppen
+# 4) Stop recording
 REMOVE 1 150
 ```
 
-Der Producer wartet aktiv darauf, dass die `.idx`-Datei wächst, sodass er
-schon während der laufenden Aufnahme zurück in die Vergangenheit springen kann.
+The producer actively waits for the `.idx` file to grow, so it can already
+seek into the past while recording is still in progress.
 
-## Interlaced testen
+## Testing Interlaced
 
-Eine echte Interlaced-Quelle ist nicht nötig — es reicht, den **CasparCG-Channel
-selbst** auf einen Interlaced-Modus zu konfigurieren. Der Channel-Mixer
-deinterlaced/interlaced intern, sodass der Replay-Consumer `field::a`/`field::b`
-sieht, egal ob die Quelle progressiv ist (NDI/OBS, FFmpeg-Datei, AMB Loop, …).
+A real interlaced source is not required — it is sufficient to configure the
+**CasparCG channel itself** to an interlaced mode. The channel mixer
+deinterlaces/interlaces internally so the replay consumer sees `field::a`/`field::b`
+regardless of whether the source is progressive (NDI/OBS, FFmpeg file, AMB Loop, …).
 
 ```xml
 <channel>
@@ -147,30 +147,33 @@ sieht, egal ob die Quelle progressiv ist (NDI/OBS, FFmpeg-Datei, AMB Loop, …).
 </channel>
 ```
 
-Im Log des Replay-Consumers sollte dann erscheinen:
+The replay consumer log should then show:
 
 ```
 replay_consumer[…] Recording 1920x1080 interlaced (UFF) @ 50 fps, 16ch @ 48000 Hz
 ```
 
-## Bekannte Einschränkungen
+## Known Limitations
 
-- Sample-Rate-Mismatch zwischen Aufnahme und Wiedergabe-Channel führt zu falscher
-  Audio-Tonhöhe. Die Sample-Rate steht im Header (v3) und wird beim Öffnen geloggt.
-- Field-Order-Heuristik des Consumers: HD interlaced (≥720 Zeilen) → upper-field-first,
-  SD interlaced → lower-field-first. Custom-Formate mit abweichender Field-Order
-  müssen hier ggf. ergänzt werden.
-- Dateiformatversion 1 (CasparCG ≤ 2.0) wird nicht mehr gelesen.
-- **Version 2 (vor Sample-Rate-Erweiterung)**: nur teilweise lesbar.
-  - **Lineare Wiedergabe (`SPEED 1`) funktioniert** — der Index-Stream wird sequenziell gelesen.
-  - **`SEEK`, `SPEED ≠ 1`, Pause/Resume und Rückwärtswiedergabe funktionieren nicht**, da `INDEX_DATA_OFFSET` jetzt das v3-Layout (16-Byte-Extended-Header) annimmt und bei v2-Dateien (12 Bytes) um 4 Bytes verrutscht.
-  - Sample-Rate fällt auf 48000 Hz zurück.
-  - Empfehlung: Aufnahme mit aktuellem Code wiederholen, sobald die Datei nicht mehr nur für reine Linear-Wiedergabe gebraucht wird. Beim Öffnen wird eine Warnung im Log ausgegeben.
+- A sample-rate mismatch between recording and playback channel causes incorrect
+  audio pitch. The sample rate is stored in the header (v3) and logged on open.
+- Field-order heuristic in the consumer: HD interlaced (≥720 lines) → upper-field-first,
+  SD interlaced → lower-field-first. Custom formats with a different field order
+  may need to be added here.
+- File format version 1 (CasparCG ≤ 2.0) is no longer supported.
+- **Version 2 (before sample-rate extension)**: partially readable.
+  - **Linear playback (`SPEED 1`) works** — the index stream is read sequentially.
+  - **`SEEK`, `SPEED ≠ 1`, pause/resume, and reverse playback do not work**, because
+    `INDEX_DATA_OFFSET` now assumes the v3 layout (16-byte extended header) and is
+    off by 4 bytes for v2 files (12 bytes).
+  - Sample rate falls back to 48000 Hz.
+  - Recommendation: re-record with the current code once the file is needed for
+    anything other than plain linear playback. A warning is logged on open.
 
-## Quelldateien
+## Source Files
 
-- [replay.cpp](replay.cpp) – Modul-Registrierung, libjpeg-Versionsdetektion
-- [consumer/replay_consumer.cpp](consumer/replay_consumer.cpp) – Aufnahme
-- [producer/replay_producer.cpp](producer/replay_producer.cpp) – Wiedergabe (incl. Slow-Motion-Blending)
-- [util/file_operations.{h,cpp}](util/file_operations.h) – `.mav`/`.idx`-Header und JPEG-I/O
-- [util/frame_operations.{h,cpp}](util/frame_operations.h) – Field-/Frame-Interlacing, Blending
+- [replay.cpp](replay.cpp) – module registration, libjpeg version detection
+- [consumer/replay_consumer.cpp](consumer/replay_consumer.cpp) – recording
+- [producer/replay_producer.cpp](producer/replay_producer.cpp) – playback (incl. slow-motion blending)
+- [util/file_operations.{h,cpp}](util/file_operations.h) – `.mav`/`.idx` header and JPEG I/O
+- [util/frame_operations.{h,cpp}](util/frame_operations.h) – field/frame interlacing, blending
