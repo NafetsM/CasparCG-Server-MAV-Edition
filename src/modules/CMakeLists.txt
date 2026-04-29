@@ -1,7 +1,6 @@
 cmake_minimum_required (VERSION 3.28)
 project("modules")
 
-add_subdirectory(replay)
 add_subdirectory(image)
 add_subdirectory(ffmpeg)
 add_subdirectory(oal)

@@ -5,7 +5,7 @@ Thank you for your interest in CasparCG Server, a professional software used to
 play out and record professional graphics, audio and video to multiple outputs.
 CasparCG Server has been in 24/7 broadcast production since 2006.
 
-The CasparCG Server works on Windows and Linux.
+The CasparCG Server works on Windows and Linux. This port though has a [replay feature](src/modules/replay/README.md) integrated and currently supports just Windows.
 
 System Requirements
 -------------------
