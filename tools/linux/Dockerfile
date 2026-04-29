@@ -1,19 +1,7 @@
-ARG IMAGE_BASE
-ARG IMAGE_BOOST
-ARG IMAGE_FFMPEG
-ARG IMAGE_CEF
+FROM docker.io/buildpack-deps:noble AS build-casparcg
+	ADD tools/linux/install-dependencies /
 
-FROM ${IMAGE_BOOST} as boost
-FROM ${IMAGE_FFMPEG} as ffmpeg
-FROM ${IMAGE_CEF} as cef
-
-
-FROM ${IMAGE_BASE} as build-casparcg
-	COPY --from=boost /opt/boost /opt/boost
-	COPY --from=ffmpeg /opt/ffmpeg /opt/ffmpeg
-	COPY --from=cef /opt/cef /opt/cef
-
-    ARG PROC_COUNT=8
+	RUN apt-get update && /install-dependencies
 
 	RUN mkdir /source && mkdir /build && mkdir /install
 
@@ -21,33 +9,39 @@ FROM ${IMAGE_BASE} as build-casparcg
 
 	WORKDIR /build
 
-	ENV BOOST_ROOT=/opt/boost
-	ENV PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig
-
-    ARG CC
-    ARG CXX
+	ARG CC
+	ARG CXX
 	ARG GIT_HASH
 
-	RUN cmake /source
-	RUN make -j $PROC_COUNT
+	RUN cmake -GNinja /source -DUSE_STATIC_BOOST=ON -DUSE_SYSTEM_CEF=OFF -DENABLE_REPLAY=OFF
+	
+	RUN cmake --build .
+
+	RUN cmake --install . --prefix staging
 
 	# Find a better way to copy deps
 	RUN ln -s /build/staging /staging && \
-		/source/shell/copy_deps.sh shell/casparcg /staging/lib
+		/source/shell/copy_deps.sh /build/shell/casparcg /staging/lib
 
-FROM nvidia/opengl:1.0-glvnd-devel-ubuntu18.04
+FROM docker.io/ubuntu:noble
 	COPY --from=build-casparcg /staging /opt/casparcg
 
 	RUN set -ex; \
-		apt-get update; \
-		apt-get install -y --no-install-recommends \
+			apt-get update; \
+			DEBIAN_FRONTEND="noninteractive" apt-get install -y --no-install-recommends \
+			tzdata \
 			libc++1 \
 			libnss3 \
 			fontconfig \
-		; \
-		rm -rf /var/lib/apt/lists/*
+			libglvnd0 \
+			libgl1 \
+			libglx0 \
+			libegl1 \
+			libgles2 \
+			; \
+			rm -rf /var/lib/apt/lists/*
 
 	WORKDIR /opt/casparcg
-
+	RUN chmod 755 run.sh
 	ADD tools/linux/run_docker.sh ./
 	CMD ["./run_docker.sh"]

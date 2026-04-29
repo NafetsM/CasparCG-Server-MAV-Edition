@@ -2,11 +2,12 @@
 
 #include <core/frame/draw_frame.h>
 #include <core/frame/frame_factory.h>
+#include <core/frame/geometry.h>
 #include <core/monitor/monitor.h>
-
-#include <boost/optional.hpp>
+#include <core/video_format.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace caspar { namespace ffmpeg {
@@ -18,15 +19,18 @@ class AVProducer
                core::video_format_desc              format_desc,
                std::string                          name,
                std::string                          path,
-               boost::optional<std::string>         vfilter,
-               boost::optional<std::string>         afilter,
-               boost::optional<int64_t>             start,
-               boost::optional<int64_t>             duration,
-               boost::optional<bool>                loop,
-               int                                  seekable);
+               std::optional<std::string>           vfilter,
+               std::optional<std::string>           afilter,
+               std::optional<int64_t>               start,
+               std::optional<int64_t>               seek,
+               std::optional<int64_t>               duration,
+               std::optional<bool>                  loop,
+               int                                  seekable,
+               core::frame_geometry::scale_mode     scale_mode);
 
-    core::draw_frame prev_frame();
-    core::draw_frame next_frame();
+    core::draw_frame prev_frame(const core::video_field field);
+    core::draw_frame next_frame(const core::video_field field);
+    bool             is_ready();
 
     AVProducer& seek(int64_t time);
     int64_t     time() const;

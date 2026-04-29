@@ -21,31 +21,22 @@
 
 #include "newtek.h"
 
-#ifdef _WIN32
-#include "consumer/newtek_ivga_consumer.h"
-#endif
-
 #include "consumer/newtek_ndi_consumer.h"
 #include "producer/newtek_ndi_producer.h"
 
 #include "util/ndi.h"
 
 #include <core/consumer/frame_consumer.h>
+#include <protocol/amcp/amcp_command_repository_wrapper.h>
 
 #include <boost/property_tree/ptree.hpp>
 #include <common/env.h>
 
 namespace caspar { namespace newtek {
 
-void init(core::module_dependencies dependencies)
+void init(const core::module_dependencies& dependencies)
 {
     try {
-#ifdef _WIN32
-        dependencies.consumer_registry->register_consumer_factory(L"iVGA Consumer", create_ivga_consumer);
-        dependencies.consumer_registry->register_preconfigured_consumer_factory(L"newtek-ivga",
-                                                                                create_preconfigured_ivga_consumer);
-#endif
-
         dependencies.consumer_registry->register_consumer_factory(L"NDI Consumer", create_ndi_consumer);
         dependencies.consumer_registry->register_preconfigured_consumer_factory(L"ndi",
                                                                                 create_preconfigured_ndi_consumer);

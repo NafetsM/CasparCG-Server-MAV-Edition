@@ -29,12 +29,7 @@
 
 #include "interop/DeckLinkAPI.h"
 
-#pragma warning(push)
-#pragma warning(disable : 4996)
-
 #include <atlbase.h>
-
-#pragma warning(pop)
 
 namespace caspar { namespace decklink {
 
@@ -43,8 +38,7 @@ using UINT32 = unsigned int;
 
 static std::wstring to_string(String bstr_string)
 {
-    std::wstring result = bstr_t(bstr_string, false);
-    return result;
+    return static_cast<const wchar_t*>(bstr_t(bstr_string, false));
 }
 
 static void com_initialize() { ::CoInitialize(nullptr); }
@@ -82,10 +76,19 @@ static com_ptr<IDeckLinkIterator> create_iterator()
     return pDecklinkIterator;
 }
 
+static com_ptr<IDeckLinkVideoFrameAncillaryPackets> create_ancillary_packets()
+{
+    CComPtr<IDeckLinkVideoFrameAncillaryPackets> pDecklinkAncillaryPackets;
+    if (FAILED(pDecklinkAncillaryPackets.CoCreateInstance(CLSID_CDeckLinkVideoFrameAncillaryPackets)))
+        CASPAR_THROW_EXCEPTION(not_supported()
+                               << msg_info("Could not create IDeckLinkVideoFrameAncillaryPackets instance."));
+    return pDecklinkAncillaryPackets;
+}
+
 template <typename I, typename T>
 static com_iface_ptr<I> iface_cast(const com_ptr<T>& ptr, bool optional = false)
 {
-    com_iface_ptr<I> result = ptr;
+    com_iface_ptr<I> result{ptr.p};
 
     if (!optional && !result)
         CASPAR_THROW_EXCEPTION(not_supported()
@@ -106,17 +109,20 @@ T* get_raw(const CComPtr<T>& ptr)
 #else
 
 #include "linux_interop/DeckLinkAPI.h"
-#include "linux_interop/DeckLinkAPIConfiguration_v10_2.h"
+#include "linux_interop/DeckLinkAPIConfiguration.h"
+#include "linux_interop/DeckLinkAPIConfiguration_v10_11.h"
+#include "linux_interop/DeckLinkAPI_v10_11.h"
 #include <memory>
 #include <typeinfo>
 
 namespace caspar { namespace decklink {
 
-using String = const char*;
-using BOOL   = bool;
+using String   = const char*;
+using BOOL     = bool;
 #define TRUE true
 #define FALSE false
-using UINT32 = uint32_t;
+using UINT32   = uint32_t;
+using LONGLONG = int64_t;
 
 static std::wstring to_string(String utf16_string) { return u16(utf16_string); }
 
@@ -161,6 +167,17 @@ static com_ptr<IDeckLinkIterator> create_iterator()
     return wrap_raw<com_ptr>(iterator, true);
 }
 
+static com_ptr<IDeckLinkVideoFrameAncillaryPackets> create_ancillary_packets()
+{
+    IDeckLinkVideoFrameAncillaryPackets* ancillaryPackets = CreateVideoFrameAncillaryPacketsInstance();
+
+    if (ancillaryPackets == nullptr)
+        CASPAR_THROW_EXCEPTION(not_supported()
+                               << msg_info("Could not create IDeckLinkVideoFrameAncillaryPackets instance."));
+
+    return wrap_raw<com_ptr>(ancillaryPackets, true);
+}
+
 template <typename T>
 static REFIID iface_id()
 {
@@ -187,24 +204,34 @@ REFIID iface_id<IDeckLinkConfiguration>()
     return IID_IDeckLinkConfiguration;
 }
 template <>
-REFIID iface_id<IDeckLinkConfiguration_v10_2>()
-{
-    return IID_IDeckLinkConfiguration_v10_2;
-}
-template <>
 REFIID iface_id<IDeckLinkKeyer>()
 {
     return IID_IDeckLinkKeyer;
 }
 template <>
-REFIID iface_id<IDeckLinkAttributes>()
+REFIID iface_id<IDeckLinkProfileAttributes>()
 {
-    return IID_IDeckLinkAttributes;
+    return IID_IDeckLinkProfileAttributes;
 }
 template <>
 REFIID iface_id<IDeckLinkInput>()
 {
     return IID_IDeckLinkInput;
+}
+template <>
+REFIID iface_id<IDeckLinkAttributes_v10_11>()
+{
+    return IID_IDeckLinkAttributes_v10_11;
+}
+template <>
+REFIID iface_id<IDeckLinkConfiguration_v10_11>()
+{
+    return IID_IDeckLinkConfiguration_v10_11;
+}
+template <>
+REFIID iface_id<IDeckLinkVideoFrameAncillaryPackets>()
+{
+    return IID_IDeckLinkVideoFrameAncillaryPackets;
 }
 
 template <typename I, typename T>

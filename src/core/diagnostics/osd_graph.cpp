@@ -23,8 +23,6 @@
 
 #include "osd_graph.h"
 
-#pragma warning(disable : 4244)
-
 #include "call_context.h"
 
 #include <common/executor.h>
@@ -33,20 +31,31 @@
 #include <SFML/Graphics.hpp>
 
 #include <boost/circular_buffer.hpp>
-#include <boost/optional.hpp>
 
 #include <tbb/concurrent_unordered_map.h>
 
 #include <GL/glew.h>
 
 #include <atomic>
+#include <cstdio>
+#include <filesystem>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
-#include <tuple>
+
+namespace fs = std::filesystem;
 
 namespace caspar { namespace core { namespace diagnostics { namespace osd {
+
+#if SFML_VERSION_MAJOR >= 3
+
+void register_sink() {}
+void show_graphs(bool value) {}
+void shutdown() {}
+
+#else
 
 static const int PREFERRED_VERTICAL_GRAPHS = 8;
 static const int RENDERING_WIDTH           = 1024;
@@ -62,12 +71,24 @@ sf::Color get_sfml_color(int color)
             static_cast<sf::Uint8>(color >> 0 & 255)};
 }
 
-sf::Font& get_default_font()
+auto& get_default_font()
 {
     static sf::Font DEFAULT_FONT = []() {
+        fs::path path{DIAG_FONT_PATH};
+#ifdef __linux__
+        if (!fs::exists(path)) {
+            auto cmd = "fc-match --format=%{file} " + path.string();
+            if (auto pipe = popen(cmd.data(), "r")) {
+                char buf[128];
+                path.clear();
+                while (fgets(buf, sizeof(buf), pipe))
+                    path += buf;
+            }
+        }
+#endif
         sf::Font font;
-        if (!font.loadFromFile("LiberationMono-Regular.ttf"))
-            CASPAR_THROW_EXCEPTION(file_not_found() << msg_info("LiberationMono-Regular.ttf not found"));
+        if (!font.loadFromFile(path.string()))
+            CASPAR_THROW_EXCEPTION(file_not_found() << msg_info(DIAG_FONT_PATH " not found"));
         return font;
     }();
 
@@ -248,9 +269,9 @@ class context : public drawable
 
 class line : public drawable
 {
-    size_t                                                   res_{1024};
-    boost::circular_buffer<sf::Vertex>                       line_data_{res_};
-    boost::circular_buffer<boost::optional<sf::VertexArray>> line_tags_{res_};
+    size_t                                                 res_{1024};
+    boost::circular_buffer<sf::Vertex>                     line_data_{res_};
+    boost::circular_buffer<std::optional<sf::VertexArray>> line_tags_{res_};
 
     std::atomic<float> tick_data_;
     std::atomic<bool>  tick_tag_;
@@ -315,14 +336,14 @@ class line : public drawable
             vertical_dash.append(sf::Vertex(sf::Vector2f(get_insertion_xcoord() - x_delta_, 1.f), color));
             line_tags_.push_back(vertical_dash);
         } else
-            line_tags_.push_back(boost::none);
+            line_tags_.push_back({});
 
         tick_tag_ = false;
 
         if (tick_data_ > -0.5) {
             auto array_one = line_data_.array_one();
             auto array_two = line_data_.array_two();
-            // since boost::circular_buffer guarantees two contigous views of the buffer we can provide raw access to
+            // since boost::circular_buffer guarantees two contiguous views of the buffer we can provide raw access to
             // SFML, which can use glDrawArrays.
             target.draw(array_one.first, static_cast<unsigned int>(array_one.second), sf::LinesStrip, states);
             target.draw(array_two.first, static_cast<unsigned int>(array_two.second), sf::LinesStrip, states);
@@ -497,5 +518,7 @@ void register_sink()
 void show_graphs(bool value) { context::show(value); }
 
 void shutdown() { context::shutdown(); }
+
+#endif
 
 }}}} // namespace caspar::core::diagnostics::osd

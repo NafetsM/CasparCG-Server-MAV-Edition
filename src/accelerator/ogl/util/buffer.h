@@ -21,7 +21,7 @@
 
 #pragma once
 
-#include <boost/property_tree/ptree.hpp>
+#include <boost/property_tree/ptree_fwd.hpp>
 #include <memory>
 
 namespace caspar { namespace accelerator { namespace ogl {
@@ -37,7 +37,7 @@ class buffer final
     ~buffer();
 
     buffer& operator=(const buffer&) = delete;
-    buffer& operator                 =(buffer&& other);
+    buffer& operator=(buffer&& other);
 
     void bind();
     void unbind();

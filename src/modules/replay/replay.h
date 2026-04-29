@@ -9,25 +9,17 @@
 * the Free Software Foundation, either version 3 of the License, or
 * (at your option) any later version.
 *
-* CasparCG is distributed in the hope that it will be useful,
-* but WITHOUT ANY WARRANTY; without even the implied warranty of
-* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-* GNU General Public License for more details.
-*
-* You should have received a copy of the GNU General Public License
-* along with CasparCG. If not, see <http://www.gnu.org/licenses/>.
-*
 * Author: Jan Starzak, jan@ministryofgoodsteps.com
-*		  Krzysztof Pyrkosz, pyrkosz@o2.pl
+*         Krzysztof Pyrkosz, pyrkosz@o2.pl
+*         Ported to CasparCG 2.5 by [your name]
 */
 
 #pragma once
 
-#include <string>
 #include <core/module_dependencies.h>
 
 namespace caspar { namespace replay {
 
-	void init(core::module_dependencies dependencies);
+    void init(core::module_dependencies dependencies);
 
-}}
+}} // namespace caspar::replay

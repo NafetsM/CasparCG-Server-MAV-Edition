@@ -55,19 +55,12 @@
 
 #include <mutex>
 
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4244)
-#endif
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/timecode.h>
 }
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
 
 using namespace caspar::ffmpeg;
 
@@ -171,6 +164,7 @@ struct bluefish_producer
     unsigned int            mode_;
 
     spl::shared_ptr<core::frame_factory> frame_factory_;
+    const core::video_format_repository  format_repository_;
     std::vector<uint8_t>                 conversion_buffer_;
 
     tbb::concurrent_bounded_queue<core::draw_frame> frame_buffer_;
@@ -191,20 +185,22 @@ struct bluefish_producer
     int uhd_mode_ = 0; // 0 -> Do Not Allow BVC-ML, 1 -> Auto ( ie. Native buffers will do default mode, or BVC will do
                        // SQ.),  2 -> Force 2SI, 3 -> Force SQ
 
-    bluefish_producer(const bluefish_producer&) = delete;
+    bluefish_producer(const bluefish_producer&)            = delete;
     bluefish_producer& operator=(const bluefish_producer&) = delete;
 
     bluefish_producer(const core::video_format_desc&              format_desc,
                       int                                         device_index,
                       int                                         stream_index,
                       int                                         uhd_mode,
-                      const spl::shared_ptr<core::frame_factory>& frame_factory)
+                      const spl::shared_ptr<core::frame_factory>& frame_factory,
+                      const core::video_format_repository&        format_repository)
         : device_index_(device_index)
         , stream_index_(stream_index)
         , blue_(create_blue(device_index))
         , model_name_(get_card_desc(*blue_, device_index))
         , channel_format_desc_(format_desc)
         , frame_factory_(frame_factory)
+        , format_repository_(format_repository)
         , memory_format_on_card_(MEM_FMT_RGB)
         , sync_format_(UPD_FMT_FRAME)
         , uhd_mode_(uhd_mode)
@@ -241,8 +237,10 @@ struct bluefish_producer
             }
 
             blue_->get_card_property32(VIDEO_MODE_EXT_INPUT, &mode_);
-            format_desc_ = get_format_desc(
-                *blue_, static_cast<EVideoModeExt>(mode_), static_cast<EMemoryFormat>(memory_format_on_card_));
+            format_desc_   = get_format_desc(format_repository,
+                                           *blue_,
+                                           static_cast<EVideoModeExt>(mode_),
+                                           static_cast<EMemoryFormat>(memory_format_on_card_));
             audio_cadence_ = format_desc_.audio_cadence;
 
             if (format_desc_.size == 0) {
@@ -281,7 +279,7 @@ struct bluefish_producer
                 return std::make_shared<blue_dma_buffer>(static_cast<int>(format_desc_.size), n++);
             });
 
-            // Allocate a single UHD buffer for converison Buffer if we need it! .
+            // Allocate a single UHD buffer for conversion Buffer if we need it! .
             if (uhd_mode_ == 2) {
                 conversion_buffer_.resize(static_cast<int>(format_desc_.size));
             }
@@ -418,11 +416,11 @@ struct bluefish_producer
                 std::lock_guard<std::mutex> lock(state_mutex_);
                 state_["file/name"]              = model_name_;
                 state_["file/path"]              = device_index_;
-                state_["file/video/width"]       = static_cast<long>(width);
-                state_["file/video/height"]      = static_cast<long>(height);
+                state_["file/video/width"]       = width;
+                state_["file/video/height"]      = height;
                 state_["file/audio/sample-rate"] = format_desc_.audio_sample_rate;
                 state_["file/audio/channels"]    = format_desc_.audio_channels;
-                state_["file/fps"]               = static_cast<double>(fps);
+                state_["file/fps"]               = fps;
                 state_["profiler/time"]          = {frame_timer.elapsed(), fps};
                 state_["buffer"]                 = {frame_buffer_.size(), frame_buffer_.capacity()};
             }
@@ -440,14 +438,14 @@ struct bluefish_producer
                 auto src_audio = alloc_frame();
 
                 // video
-                src_video->format                 = AV_PIX_FMT_RGB24;
-                src_video->width                  = width;
-                src_video->height                 = height;
-                src_video->interlaced_frame       = !is_progressive;
-                src_video->top_field_first        = height != 486;
-                src_video->key_frame              = 1;
-                src_video->display_picture_number = frames_captured;
-                src_video->pts                    = capture_ts;
+                src_video->format           = AV_PIX_FMT_RGB24;
+                src_video->width            = width;
+                src_video->height           = height;
+                src_video->interlaced_frame = !is_progressive;
+                src_video->top_field_first  = height != 486;
+                src_video->key_frame        = 1;
+                // src_video->display_picture_number = frames_captured;
+                src_video->pts = capture_ts;
 
                 void* video_bytes = reserved_frames_.front()->image_data();
                 if (reserved_frames_.front() && video_bytes) {
@@ -456,13 +454,13 @@ struct bluefish_producer
                 }
 
                 // Audio
-                src_audio->format      = AV_SAMPLE_FMT_S32;
-                src_audio->channels    = format_desc_.audio_channels;
+                src_audio->format = AV_SAMPLE_FMT_S32;
+                av_channel_layout_default(&src_audio->ch_layout, format_desc_.audio_channels);
                 src_audio->sample_rate = format_desc_.audio_sample_rate;
                 src_audio->nb_samples  = 0;
                 int samples_decoded    = 0;
 
-                // hmm is audio on first frame or do we need to wait till snd feild to get audio?
+                // hmm is audio on first frame or do we need to wait till snd field to get audio?
                 if (sync_format_ == UPD_FMT_FRAME || (sync_format_ == UPD_FMT_FIELD && first_frame_)) {
                     void* audio_bytes = nullptr;
                     auto  hanc_buffer = reinterpret_cast<uint8_t*>(reserved_frames_.front()->hanc_data());
@@ -475,15 +473,15 @@ struct bluefish_producer
                                                        card_type,
                                                        reinterpret_cast<unsigned int*>(hanc_buffer),
                                                        reinterpret_cast<unsigned int*>(&decoded_audio_bytes_[0]),
-                                                       src_audio->channels);
+                                                       format_desc_.audio_channels);
 
                         audio_bytes = reinterpret_cast<int32_t*>(&decoded_audio_bytes_[0]);
 
-                        samples_decoded       = no_extracted_pcm_samples / src_audio->channels;
+                        samples_decoded       = no_extracted_pcm_samples / format_desc_.audio_channels;
                         src_audio->nb_samples = samples_decoded;
                         src_audio->data[0]    = reinterpret_cast<uint8_t*>(audio_bytes);
                         src_audio->linesize[0] =
-                            src_audio->nb_samples * src_audio->channels *
+                            src_audio->nb_samples * format_desc_.audio_channels *
                             av_get_bytes_per_sample(static_cast<AVSampleFormat>(src_audio->format));
                         src_audio->pts = capture_ts;
                     }
@@ -499,7 +497,7 @@ struct bluefish_producer
                         auto audio_bytes = reinterpret_cast<uint8_t*>(&decoded_audio_bytes_[0]);
                         if (audio_bytes) {
                             src_audio->nb_samples     = remainaing_audio_samples_;
-                            int bytes_left            = remainaing_audio_samples_ * 4 * src_audio->channels;
+                            int bytes_left            = remainaing_audio_samples_ * 4 * format_desc_.audio_channels;
                             src_audio->data[0]        = audio_bytes + bytes_left;
                             src_audio->linesize[0]    = bytes_left;
                             remainaing_audio_samples_ = 0;
@@ -627,10 +625,12 @@ struct bluefish_producer
         }
     }
 
-    core::draw_frame get_frame()
+    core::draw_frame get_frame(const core::video_field field)
     {
         if (exception_ != nullptr)
             std::rethrow_exception(exception_);
+
+        // TODO - field
 
         core::draw_frame frame;
         if (!frame_buffer_.try_pop(frame)) {
@@ -638,6 +638,8 @@ struct bluefish_producer
         }
         return frame;
     }
+
+    bool is_ready() { return !frame_buffer_.empty(); }
 
     std::wstring print() const
     {
@@ -649,8 +651,6 @@ struct bluefish_producer
         std::lock_guard<std::mutex> lock(state_mutex_);
         return state_;
     }
-
-    boost::rational<int> get_out_framerate() const { return format_desc_.framerate; }
 };
 
 class bluefish_producer_proxy : public core::frame_producer
@@ -662,6 +662,7 @@ class bluefish_producer_proxy : public core::frame_producer
   public:
     explicit bluefish_producer_proxy(const core::video_format_desc&              format_desc,
                                      const spl::shared_ptr<core::frame_factory>& frame_factory,
+                                     const core::video_format_repository&        format_repository,
                                      int                                         device_index,
                                      int                                         stream_index,
                                      int                                         uhd_mode,
@@ -670,30 +671,41 @@ class bluefish_producer_proxy : public core::frame_producer
         , executor_(L"bluefish_producer[" + std::to_wstring(device_index) + L"]")
     {
         auto ctx = core::diagnostics::call_context::for_thread();
-        executor_.invoke([=] {
+        executor_.invoke([=, this] {
             core::diagnostics::call_context::for_thread() = ctx;
-            producer_.reset(new bluefish_producer(format_desc, device_index, stream_index, uhd_mode, frame_factory));
+            producer_.reset(new bluefish_producer(
+                format_desc, device_index, stream_index, uhd_mode, frame_factory, format_repository));
         });
     }
 
     ~bluefish_producer_proxy()
     {
-        executor_.invoke([=] { producer_.reset(); });
+        executor_.invoke([=, this] { producer_.reset(); });
     }
 
     core::monitor::state state() const override { return producer_->state(); }
 
     // frame_producer
 
-    core::draw_frame receive_impl(int nb_samples) override { return producer_->get_frame(); }
+    core::draw_frame receive_impl(const core::video_field field, int nb_samples) override
+    {
+        return producer_->get_frame(field);
+    }
+
+    core::draw_frame first_frame(const core::video_field field) override { return receive_impl(field, 0); }
+
+    core::draw_frame last_frame(const core::video_field field) override
+    {
+        return core::draw_frame::still(producer_->get_frame(field));
+    }
+
+    bool is_ready() override { return producer_->is_ready(); }
 
     uint32_t nb_frames() const override { return length_; }
 
     std::wstring print() const override { return producer_->print(); }
 
     std::wstring name() const override { return L"bluefish"; }
-
-    boost::rational<int> get_out_framerate() const { return producer_->get_out_framerate(); }
 };
 
 spl::shared_ptr<core::frame_producer> create_producer(const core::frame_producer_dependencies& dependencies,
@@ -715,11 +727,14 @@ spl::shared_ptr<core::frame_producer> create_producer(const core::frame_producer
         uhd_mode = 0;
 
     auto length         = get_param(L"LENGTH", params, std::numeric_limits<uint32_t>::max());
-    auto in_format_desc = core::video_format_desc(get_param(L"FORMAT", params, L"INVALID"));
+    auto in_format_desc = dependencies.format_repository.find(get_param(L"FORMAT", params, L"INVALID"));
 
-    auto producer = spl::make_shared<bluefish_producer_proxy>(
-        dependencies.format_desc, dependencies.frame_factory, device_index, stream_index, uhd_mode, length);
-
-    return create_destroy_proxy(producer);
+    return spl::make_shared<bluefish_producer_proxy>(dependencies.format_desc,
+                                                     dependencies.frame_factory,
+                                                     dependencies.format_repository,
+                                                     device_index,
+                                                     stream_index,
+                                                     uhd_mode,
+                                                     length);
 }
 }} // namespace caspar::bluefish

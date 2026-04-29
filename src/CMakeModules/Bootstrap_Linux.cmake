@@ -1,9 +1,23 @@
+cmake_minimum_required (VERSION 3.28)
+
+include(ExternalProject)
+include(FetchContent)
+
+if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
+endif()
+# Prefer the new boost helper
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)
+endif()
+
+set(ENABLE_HTML ON CACHE BOOL "Enable CEF and HTML producer")
+set(USE_STATIC_BOOST OFF CACHE BOOL "Use shared library version of Boost")
+set(USE_SYSTEM_CEF ON CACHE BOOL "Use the version of cef from your OS (only tested with Ubuntu)")
+set(CASPARCG_BINARY_NAME "casparcg" CACHE STRING "Custom name of the binary to build (this disables some install files)")
+set(ENABLE_AVX2 OFF CACHE BOOL "Enable the AVX2 instruction set (requires a CPU that supports it)")
+
 # Determine build (target) platform
-INCLUDE (PlatformIntrospection)
-TEST_FOR_SUPPORTED_PLATFORM (SUPPORTED_PLATFORM)
-_DETERMINE_PLATFORM (CONFIG_PLATFORM)
-_DETERMINE_ARCH (CONFIG_ARCH)
-_DETERMINE_CPU_COUNT (CONFIG_CPU_COUNT)
 SET (PLATFORM_FOLDER_NAME "linux")
 
 IF (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -13,50 +27,79 @@ IF (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 ENDIF ()
 MARK_AS_ADVANCED (CMAKE_INSTALL_PREFIX)
 
-FIND_PACKAGE (Git)
-SET (CONFIG_VERSION_GIT_HASH "N/A")
-IF (DEFINED ENV{GIT_HASH} AND NOT $ENV{GIT_HASH} STREQUAL "")
-	SET (CONFIG_VERSION_GIT_HASH "$ENV{GIT_HASH}")
-ELSEIF (GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/../.git")
-	EXEC_PROGRAM ("${GIT_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/../" ARGS rev-parse --verify --short HEAD OUTPUT_VARIABLE CONFIG_VERSION_GIT_HASH)
-ENDIF ()
-
-SET (BOOST_ROOT_PATH "/opt/boost" CACHE STRING "Path to Boost")
-SET (ENV{BOOST_ROOT} "${BOOST_ROOT_PATH}")
-SET (Boost_USE_DEBUG_LIBS ON)
-SET (Boost_USE_RELEASE_LIBS OFF)
-SET (Boost_USE_STATIC_LIBS ON)
-FIND_PACKAGE (Boost 1.66.0 COMPONENTS system thread chrono filesystem log locale regex date_time coroutine REQUIRED)
-
-SET (FFMPEG_ROOT_PATH "/opt/ffmpeg/lib/pkgconfig" CACHE STRING "Path to FFMPEG")
-SET (ENV{PKG_CONFIG_PATH} "$ENV{PKG_CONFIG_PATH}:${FFMPEG_ROOT_PATH}")
-FIND_PACKAGE (FFmpeg REQUIRED)
-LINK_DIRECTORIES( ${FFMPEG_LIBRARY_DIRS} )
-
-FIND_PACKAGE (OpenGL REQUIRED)
-FIND_PACKAGE (FreeImage REQUIRED)
-FIND_PACKAGE (GLEW REQUIRED)
-FIND_PACKAGE (TBB REQUIRED)
-FIND_PACKAGE (OpenAL REQUIRED)
-FIND_PACKAGE (SFML 2 COMPONENTS graphics window system REQUIRED)
-FIND_PACKAGE (X11 REQUIRED)
+if (USE_STATIC_BOOST)
+	SET (Boost_USE_STATIC_LIBS ON)
+endif()
+find_package(Boost 1.83.0 COMPONENTS thread filesystem log_setup log locale regex date_time coroutine REQUIRED)
+find_package(FFmpeg REQUIRED)
+find_package(OpenGL REQUIRED COMPONENTS OpenGL GLX EGL)
+find_package(GLEW REQUIRED)
+find_package(TBB REQUIRED)
+find_package(OpenAL REQUIRED)
+find_package(SFML 3 COMPONENTS Graphics System Window QUIET)
+if(NOT SFML_FOUND)
+    find_package(SFML 2 COMPONENTS graphics system window REQUIRED)
+endif()
+find_package(X11 REQUIRED)
 
 if (ENABLE_HTML)
-	SET(CEF_ROOT_DIR "/opt/cef" CACHE STRING "Path to CEF")
-	FIND_PACKAGE (CEF REQUIRED)
+    if (USE_SYSTEM_CEF)
+        set(CEF_LIB_PATH "/usr/lib/casparcg-cef-142")
+
+        add_library(CEF::CEF INTERFACE IMPORTED)
+        target_include_directories(CEF::CEF INTERFACE
+            "/usr/include/casparcg-cef-142"
+        )
+        target_link_libraries(CEF::CEF INTERFACE
+            "-Wl,-rpath,${CEF_LIB_PATH} ${CEF_LIB_PATH}/libcef.so"
+            "${CEF_LIB_PATH}/libcef_dll_wrapper.a"
+        )
+    else()
+        casparcg_add_external_project(cef)
+        ExternalProject_Add(cef
+            URL ${CASPARCG_DOWNLOAD_MIRROR}/cef/cef_binary_142.0.17+g60aac24+chromium-142.0.7444.176_linux64_minimal.tar.bz2
+            URL_HASH SHA256=1d89e19b2f446105f9a1fe6fdc96bced86249b5884241dcc4013b7c94dabf424
+            DOWNLOAD_DIR ${CASPARCG_DOWNLOAD_CACHE}
+            CMAKE_ARGS -DUSE_SANDBOX=Off
+            INSTALL_COMMAND ""
+            BUILD_BYPRODUCTS
+                "<SOURCE_DIR>/Release/libcef.so"
+                "<BINARY_DIR>/libcef_dll_wrapper/libcef_dll_wrapper.a"
+        )
+        ExternalProject_Get_Property(cef SOURCE_DIR)
+        ExternalProject_Get_Property(cef BINARY_DIR)
+
+        add_library(CEF::CEF INTERFACE IMPORTED)
+        target_include_directories(CEF::CEF INTERFACE
+            "${SOURCE_DIR}"
+        )
+        target_link_libraries(CEF::CEF INTERFACE
+            # Note: All of these must be referenced in the BUILD_BYPRODUCTS above, to satisfy ninja
+            "${SOURCE_DIR}/Release/libcef.so"
+            "${BINARY_DIR}/libcef_dll_wrapper/libcef_dll_wrapper.a"
+        )
+
+        install(DIRECTORY ${SOURCE_DIR}/Resources/locales TYPE LIB)
+        install(FILES ${SOURCE_DIR}/Resources/chrome_100_percent.pak TYPE LIB)
+        install(FILES ${SOURCE_DIR}/Resources/chrome_200_percent.pak TYPE LIB)
+        install(FILES ${SOURCE_DIR}/Resources/icudtl.dat TYPE LIB)
+        install(FILES ${SOURCE_DIR}/Resources/resources.pak TYPE LIB)
+
+        install(FILES ${SOURCE_DIR}/Release/chrome-sandbox TYPE LIB)
+        install(FILES ${SOURCE_DIR}/Release/libcef.so TYPE LIB)
+        install(FILES ${SOURCE_DIR}/Release/libEGL.so TYPE LIB)
+        install(FILES ${SOURCE_DIR}/Release/libGLESv2.so TYPE LIB)
+        install(FILES ${SOURCE_DIR}/Release/libvk_swiftshader.so TYPE LIB)
+        install(FILES ${SOURCE_DIR}/Release/libvulkan.so.1 TYPE LIB)
+        install(FILES ${SOURCE_DIR}/Release/v8_context_snapshot.bin TYPE LIB)
+        install(FILES ${SOURCE_DIR}/Release/vk_swiftshader_icd.json TYPE LIB)
+    endif()
 endif ()
 
 SET (BOOST_INCLUDE_PATH "${Boost_INCLUDE_DIRS}")
-SET (TBB_INCLUDE_PATH "${TBB_INCLUDE_DIRS}")
-SET (GLEW_INCLUDE_PATH "${GLEW_INCLUDE_DIRS}")
-SET (SFML_INCLUDE_PATH "${SFML_INCLUDE_DIR}")
 SET (FFMPEG_INCLUDE_PATH "${FFMPEG_INCLUDE_DIRS}")
-SET (ASMLIB_INCLUDE_PATH "${EXTERNAL_INCLUDE_PATH}")
-SET (FREEIMAGE_INCLUDE_PATH "${FreeImage_INCLUDE_DIRS}")
 
-set(CEF_INCLUDE_PATH "${CEF_ROOT_DIR}")
-set(CEF_BIN_PATH "${CEF_ROOT_DIR}/Release")
-set(CEF_RESOURCE_PATH "${CEF_ROOT_DIR}/Resources")
+LINK_DIRECTORIES("${FFMPEG_LIBRARY_DIRS}")
 
 SET_PROPERTY (GLOBAL PROPERTY USE_FOLDERS ON)
 
@@ -64,16 +107,36 @@ ADD_DEFINITIONS (-DSFML_STATIC)
 ADD_DEFINITIONS (-DUNICODE)
 ADD_DEFINITIONS (-D_UNICODE)
 ADD_DEFINITIONS (-DGLEW_NO_GLU)
+ADD_DEFINITIONS (-DGLEW_EGL)
 ADD_DEFINITIONS (-D__NO_INLINE__) # Needed for precompiled headers to work
 ADD_DEFINITIONS (-DBOOST_NO_SWPRINTF) # swprintf on Linux seems to always use , as decimal point regardless of C-locale or C++-locale
 ADD_DEFINITIONS (-DTBB_USE_CAPTURED_EXCEPTION=1)
 ADD_DEFINITIONS (-DNDEBUG) # Needed for precompiled headers to work
+ADD_DEFINITIONS (-DBOOST_LOCALE_HIDE_AUTO_PTR) # Needed for C++17 in boost 1.67+
 
-ADD_COMPILE_OPTIONS (-std=c++14) # Needed for precompiled headers to work
-ADD_COMPILE_OPTIONS (-O3) # Needed for precompiled headers to work
-ADD_COMPILE_OPTIONS (-msse3)
-ADD_COMPILE_OPTIONS (-mssse3)
-ADD_COMPILE_OPTIONS (-msse4.1)
+
+if (NOT USE_STATIC_BOOST)
+	ADD_DEFINITIONS (-DBOOST_ALL_DYN_LINK)
+endif()
+
+IF (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+	ADD_COMPILE_OPTIONS (-O3) # Needed for precompiled headers to work
+endif()
+IF (CMAKE_SYSTEM_PROCESSOR MATCHES "(i[3-6]86|x64|x86_64|amd64|e2k)")
+    ADD_COMPILE_OPTIONS (-msse3)
+    ADD_COMPILE_OPTIONS (-mssse3)
+    ADD_COMPILE_OPTIONS (-msse4.1)
+    IF (ENABLE_AVX2)
+        ADD_COMPILE_OPTIONS (-mfma)
+        ADD_COMPILE_OPTIONS (-mavx)
+        ADD_COMPILE_OPTIONS (-mavx2)
+    ENDIF ()
+ELSE ()
+    ADD_COMPILE_DEFINITIONS (USE_SIMDE) # Enable OpenMP support in simde
+    ADD_COMPILE_DEFINITIONS (SIMDE_ENABLE_OPENMP) # Enable OpenMP support in simde
+    ADD_COMPILE_OPTIONS (-fopenmp-simd) # Enable OpenMP SIMD support
+ENDIF ()
+
 ADD_COMPILE_OPTIONS (-fnon-call-exceptions) # Allow signal handler to throw exception
 
 ADD_COMPILE_OPTIONS (-Wno-deprecated-declarations -Wno-write-strings -Wno-multichar -Wno-cpp -Werror)
@@ -86,64 +149,3 @@ ELSEIF (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     message(STATUS "ADDING: -DTBB_USE_GLIBCXX_VERSION=${TBB_USE_GLIBCXX_VERSION}")
     add_definitions(-DTBB_USE_GLIBCXX_VERSION=${TBB_USE_GLIBCXX_VERSION})
 ENDIF ()
-
-IF (POLICY CMP0045)
-	CMAKE_POLICY (SET CMP0045 OLD)
-ENDIF ()
-
-SET (CASPARCG_MODULE_INCLUDE_STATEMENTS "" CACHE INTERNAL "")
-SET (CASPARCG_MODULE_INIT_STATEMENTS "" CACHE INTERNAL "")
-SET (CASPARCG_MODULE_UNINIT_STATEMENTS "" CACHE INTERNAL "")
-SET (CASPARCG_MODULE_COMMAND_LINE_ARG_INTERCEPTORS_STATEMENTS "" CACHE INTERNAL "")
-SET (CASPARCG_MODULE_PROJECTS "" CACHE INTERNAL "")
-SET (CASPARCG_RUNTIME_DEPENDENCIES "" CACHE INTERNAL "")
-
-INCLUDE (PrecompiledHeader)
-
-FUNCTION (casparcg_add_include_statement HEADER_FILE_TO_INCLUDE)
-	SET (CASPARCG_MODULE_INCLUDE_STATEMENTS "${CASPARCG_MODULE_INCLUDE_STATEMENTS}"
-			"#include <${HEADER_FILE_TO_INCLUDE}>"
-			CACHE INTERNAL ""
-	)
-ENDFUNCTION ()
-
-FUNCTION (casparcg_add_init_statement INIT_FUNCTION_NAME NAME_TO_LOG)
-	SET (CASPARCG_MODULE_INIT_STATEMENTS "${CASPARCG_MODULE_INIT_STATEMENTS}"
-			"	${INIT_FUNCTION_NAME}(dependencies)\;"
-			"	CASPAR_LOG(info) << L\"Initialized ${NAME_TO_LOG} module.\"\;"
-			""
-			CACHE INTERNAL ""
-	)
-ENDFUNCTION ()
-
-FUNCTION (casparcg_add_uninit_statement UNINIT_FUNCTION_NAME)
-	SET (CASPARCG_MODULE_UNINIT_STATEMENTS
-			"	${UNINIT_FUNCTION_NAME}()\;"
-			"${CASPARCG_MODULE_UNINIT_STATEMENTS}"
-			CACHE INTERNAL ""
-	)
-ENDFUNCTION ()
-
-FUNCTION (casparcg_add_command_line_arg_interceptor INTERCEPTOR_FUNCTION_NAME)
-	set(CASPARCG_MODULE_COMMAND_LINE_ARG_INTERCEPTORS_STATEMENTS "${CASPARCG_MODULE_COMMAND_LINE_ARG_INTERCEPTORS_STATEMENTS}"
-			"	if (${INTERCEPTOR_FUNCTION_NAME}(argc, argv))"
-			"		return true\;"
-			""
-			CACHE INTERNAL ""
-	)
-ENDFUNCTION ()
-
-FUNCTION (casparcg_add_module_project PROJECT)
-	SET (CASPARCG_MODULE_PROJECTS "${CASPARCG_MODULE_PROJECTS}" "${PROJECT}" CACHE INTERNAL "")
-ENDFUNCTION ()
-
-# http://stackoverflow.com/questions/7172670/best-shortest-way-to-join-a-list-in-cmake
-FUNCTION (join_list VALUES GLUE OUTPUT)
-	STRING (REGEX REPLACE "([^\\]|^);" "\\1${GLUE}" _TMP_STR "${VALUES}")
-	STRING (REGEX REPLACE "[\\](.)" "\\1" _TMP_STR "${_TMP_STR}") #fixes escaping
-	SET (${OUTPUT} "${_TMP_STR}" PARENT_SCOPE)
-ENDFUNCTION ()
-
-FUNCTION (casparcg_add_runtime_dependency FILE_TO_COPY)
-	SET (CASPARCG_RUNTIME_DEPENDENCIES "${CASPARCG_RUNTIME_DEPENDENCIES}" "${FILE_TO_COPY}" CACHE INTERNAL "")
-ENDFUNCTION ()

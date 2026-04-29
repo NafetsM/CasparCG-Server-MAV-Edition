@@ -2,37 +2,42 @@
 * Copyright (c) 2011 Sveriges Television AB <info@casparcg.com>
 * Copyright (c) 2013 Technical University of Lodz Multimedia Centre <office@cm.p.lodz.pl>
 *
-* This file is part of CasparCG (www.casparcg.com).
-*
-* CasparCG is free software: you can redistribute it and/or modify
-* it under the terms of the GNU General Public License as published by
-* the Free Software Foundation, either version 3 of the License, or
-* (at your option) any later version.
-*
-* CasparCG is distributed in the hope that it will be useful,
-* but WITHOUT ANY WARRANTY; without even the implied warranty of
-* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-* GNU General Public License for more details.
-*
-* You should have received a copy of the GNU General Public License
-* along with CasparCG. If not, see <http://www.gnu.org/licenses/>.
-*
-* Author: Jan Starzak, jan@ministryofgoodsteps.com
-*		  Krzysztof Pyrkosz, pyrkosz@o2.pl
+* Ported to CasparCG 2.5
 */
 
 #pragma once
 
-#include <stdint.h>
+#include <cstdint>
 
-typedef uint8_t mmx_uint8_t;
+using mmx_uint8_t = uint8_t;
 
 namespace caspar { namespace replay {
 
-void interlace_fields(const mmx_uint8_t* src1, const mmx_uint8_t* src2, mmx_uint8_t* dst, uint32_t width, uint32_t height, uint32_t stride);
-void interlace_frames(const mmx_uint8_t* src1, const mmx_uint8_t* src2, mmx_uint8_t* dst, uint32_t width, uint32_t height, uint32_t stride);
-void field_double(const mmx_uint8_t* src, mmx_uint8_t* dst, uint32_t width, uint32_t height, uint32_t stride);
-void blend_images(const mmx_uint8_t* src1, mmx_uint8_t* src2, mmx_uint8_t* dst, uint32_t width, uint32_t height, uint32_t stride, uint8_t level);
+// Interlace two separate fields into one frame (alternating lines)
+void interlace_fields(const mmx_uint8_t* src1, const mmx_uint8_t* src2,
+                      mmx_uint8_t* dst,
+                      uint32_t width, uint32_t height, uint32_t stride);
+
+// Interlace two full frames into one interlaced frame
+void interlace_frames(const mmx_uint8_t* src1, const mmx_uint8_t* src2,
+                      mmx_uint8_t* dst,
+                      uint32_t width, uint32_t height, uint32_t stride);
+
+// Double a single field to a full-height frame (interpolated odd rows)
+void field_double(const mmx_uint8_t* src, mmx_uint8_t* dst,
+                  uint32_t width, uint32_t height, uint32_t stride);
+
+// Line-double a single field: each source line is copied to two consecutive
+// dest lines. Used when the consumer is the channel mixer of an interlaced
+// output — it extracts every-other row, so both copies must contain the field.
+void line_double(const mmx_uint8_t* src, mmx_uint8_t* dst,
+                 uint32_t width, uint32_t height, uint32_t stride);
+
+// Alpha-blend two images: dst = src1*(level/64) + src2*((64-level)/64)
+void blend_images(const mmx_uint8_t* src1, mmx_uint8_t* src2, mmx_uint8_t* dst,
+                  uint32_t width, uint32_t height, uint32_t stride, uint8_t level);
+
+// Fill buffer with black (zero)
 void black_frame(mmx_uint8_t* dst, uint32_t width, uint32_t height, uint32_t stride);
 
-}}
+}} // namespace caspar::replay

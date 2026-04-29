@@ -24,8 +24,8 @@
 
 #include "../util/blue_velvet.h"
 #include "../util/memory.h"
-#include "bluefish_consumer.h"
 
+#include <core/consumer/channel_info.h>
 #include <core/consumer/frame_consumer.h>
 #include <core/frame/frame.h>
 
@@ -167,9 +167,9 @@ struct bluefish_consumer
     const int           channel_index_;
     const configuration config_;
 
-    spl::shared_ptr<bvc_wrapper> blue_ = create_blue(config_.device_index);
+    spl::shared_ptr<bvc_wrapper> blue_         = create_blue(config_.device_index);
     spl::shared_ptr<bvc_wrapper> watchdog_bvc_ = create_blue(config_.device_index);
-    
+
     std::mutex         exception_mutex_;
     std::exception_ptr exception_;
 
@@ -206,7 +206,7 @@ struct bluefish_consumer
     caspar::timer                       tick_timer_;
     caspar::timer                       sync_timer_;
 
-    bluefish_consumer(const bluefish_consumer&) = delete;
+    bluefish_consumer(const bluefish_consumer&)            = delete;
     bluefish_consumer& operator=(const bluefish_consumer&) = delete;
 
     bluefish_consumer(const configuration& config, const core::video_format_desc& format_desc, int channel_index)
@@ -239,7 +239,7 @@ struct bluefish_consumer
         // Specify the video channel
         setup_hardware_output_channel(); // ie stream id
 
-        model_name_ = get_card_desc(*blue_.get(), (int)config_.device_index); 
+        model_name_ = get_card_desc(*blue_.get(), (int)config_.device_index);
 
         // disable the video output while we do all the config.
         disable_video_output();
@@ -317,7 +317,7 @@ struct bluefish_consumer
             SetThreadPriority(handle, THREAD_PRIORITY_HIGHEST);
 #endif
         }
-            
+
         configure_watchdog();
         enable_video_output();
     }
@@ -382,8 +382,8 @@ struct bluefish_consumer
                 blue_prop = EPOCH_WATCHDOG_TIMER_SET_MACRO(enum_blue_app_watchdog_timer_start_stop, (unsigned int)0);
                 blue_->set_card_property32(EPOCH_APP_WATCHDOG_TIMER, blue_prop);
             }
-           
-            // Setting up the watchdog properties 
+
+            // Setting up the watchdog properties
             unsigned int watchdog_timer_gpo_port = 1; // GPO port to use: 0 = none, 1 = port A, 2 = port B
             blue_prop =
                 EPOCH_WATCHDOG_TIMER_SET_MACRO(enum_blue_app_watchdog_enable_gpo_on_active, watchdog_timer_gpo_port);
@@ -521,7 +521,7 @@ struct bluefish_consumer
                     if (blue_->set_card_property32(MR2_ROUTING, routing_value))
                         CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Failed to MR 2 routing."));
 
-                    if (is_epoch_neutron_1i2o_card(*blue_)) // Neutron cards require setting the Genlock conector to
+                    if (is_epoch_neutron_1i2o_card(*blue_)) // Neutron cards require setting the Genlock connector to
                                                             // Aux to enable them to do Dual-Link
                     {
                         ULONG genLockSource = BlueGenlockAux;
@@ -619,8 +619,9 @@ struct bluefish_consumer
             CASPAR_LOG(error) << print() << TEXT(" Failed to disable audio output.");
     }
 
-    bool send(core::const_frame frame)
+    bool send(core::video_field field, core::const_frame frame)
     {
+        // TODO - field alignment
         {
             std::lock_guard<std::mutex> lock(exception_mutex_);
             if (exception_ != nullptr) {
@@ -845,22 +846,24 @@ struct bluefish_consumer_proxy : public core::frame_consumer
 
     ~bluefish_consumer_proxy()
     {
-        executor_.invoke([=] { consumer_.reset(); });
+        executor_.invoke([=, this] { consumer_.reset(); });
     }
 
     // frame_consumer
-    void initialize(const core::video_format_desc& format_desc, int channel_index) override
+    void initialize(const core::video_format_desc& format_desc,
+                    const core::channel_info&      channel_info,
+                    int                            port_index) override
     {
         format_desc_ = format_desc;
-        executor_.invoke([=] {
+        executor_.invoke([=, this] {
             consumer_.reset();
-            consumer_.reset(new bluefish_consumer(config_, format_desc, channel_index));
+            consumer_.reset(new bluefish_consumer(config_, format_desc, channel_info.index));
         });
     }
 
-    std::future<bool> send(core::const_frame frame) override
+    std::future<bool> send(core::video_field field, core::const_frame frame) override
     {
-        return executor_.begin_invoke([=] { return consumer_->send(frame); });
+        return executor_.begin_invoke([=, this] { return consumer_->send(field, frame); });
     }
 
     std::wstring print() const override { return consumer_ ? consumer_->print() : L"[bluefish_consumer]"; }
@@ -870,22 +873,36 @@ struct bluefish_consumer_proxy : public core::frame_consumer
     int index() const override { return 400 + config_.device_index; }
 
     bool has_synchronization_clock() const override { return true; }
+
+    core::monitor::state state() const override
+    {
+        core::monitor::state state;
+        state["bluefish/index"]          = config_.device_index;
+        state["bluefish/stream"]         = static_cast<unsigned int>(config_.device_stream);
+        state["bluefish/embedded_audio"] = config_.embedded_audio;
+        return state;
+    }
 };
 
-spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wstring>&                  params,
-                                                      std::vector<spl::shared_ptr<core::video_channel>> channels)
+spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wstring>&     params,
+                                                      const core::video_format_repository& format_repository,
+                                                      const std::vector<spl::shared_ptr<core::video_channel>>& channels,
+                                                      const core::channel_info& channel_info)
 {
     if (params.size() < 1 || !boost::iequals(params.at(0), L"BLUEFISH")) {
         return core::frame_consumer::empty();
     }
 
+    if (channel_info.depth != common::bit_depth::bit8)
+        CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Bluefish consumer only supports 8-bit color depth."));
+
     configuration config;
 
-    const auto device_index       = params.size() > 1 ? std::stoi(params.at(1)) : 1;
-    const auto device_stream      = contains_param(L"SDI-STREAM", params);
-    const auto embedded_audio     = contains_param(L"EMBEDDED_AUDIO", params);
-    const auto keyer_option       = contains_param(L"KEYER", params);
-    const auto keyer_audio_option = contains_param(L"INTERNAL-KEYER-AUDIO-SOURCE", params);
+    // const auto device_index       = params.size() > 1 ? std::stoi(params.at(1)) : 1;
+    // const auto device_stream      = contains_param(L"SDI-STREAM", params);
+    // const auto embedded_audio     = contains_param(L"EMBEDDED_AUDIO", params);
+    // const auto keyer_option       = contains_param(L"KEYER", params);
+    // const auto keyer_audio_option = contains_param(L"INTERNAL-KEYER-AUDIO-SOURCE", params);
 
     config.device_stream = bluefish_hardware_output_channel::channel_1;
     if (contains_param(L"1", params))
@@ -926,12 +943,17 @@ spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wst
 }
 
 spl::shared_ptr<core::frame_consumer>
-create_preconfigured_consumer(const boost::property_tree::wptree&               ptree,
-                              std::vector<spl::shared_ptr<core::video_channel>> channels)
+create_preconfigured_consumer(const boost::property_tree::wptree&                      ptree,
+                              const core::video_format_repository&                     format_repository,
+                              const std::vector<spl::shared_ptr<core::video_channel>>& channels,
+                              const core::channel_info&                                channel_info)
 {
     configuration config;
     auto          device_index = ptree.get(L"device", 1);
     config.device_index        = device_index;
+
+    if (channel_info.depth != common::bit_depth::bit8)
+        CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Bluefish consumer only supports 8-bit color depth."));
 
     auto device_stream = ptree.get(L"sdi-stream", L"1");
     if (device_stream == L"1")

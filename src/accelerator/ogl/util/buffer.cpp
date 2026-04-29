@@ -20,9 +20,13 @@
  */
 #include "buffer.h"
 
+#include <boost/property_tree/ptree.hpp>
+
 #include <common/gl/gl_check.h>
 
 #include <GL/glew.h>
+
+#include <atomic>
 
 namespace caspar { namespace accelerator { namespace ogl {
 
@@ -40,7 +44,7 @@ struct buffer::impl
     GLenum     target_ = 0;
     GLbitfield flags_  = 0;
 
-    impl(const impl&) = delete;
+    impl(const impl&)            = delete;
     impl& operator=(const impl&) = delete;
 
   public:

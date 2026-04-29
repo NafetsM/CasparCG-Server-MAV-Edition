@@ -24,6 +24,8 @@
 #include "fwd.h"
 #include "video_format.h"
 
+#include "frame/pixel_format.h"
+
 #include "monitor/monitor.h"
 
 #include <common/memory.h>
@@ -56,11 +58,11 @@ struct route
     route(route&&)      = default;
 
     route& operator=(const route&) = delete;
-    route& operator=(route&&) = default;
+    route& operator=(route&&)      = default;
 
-    boost::signals2::signal<void(class draw_frame)> signal;
-    video_format_desc                               format_desc;
-    std::wstring                                    name;
+    boost::signals2::signal<void(class draw_frame, class draw_frame)> signal;
+    video_format_desc                                                 format_desc;
+    std::wstring                                                      name;
 };
 
 class video_channel final
@@ -71,25 +73,25 @@ class video_channel final
   public:
     explicit video_channel(int                                       index,
                            const video_format_desc&                  format_desc,
+                           color_space                               default_color_space,
                            std::unique_ptr<image_mixer>              image_mixer,
                            std::function<void(core::monitor::state)> on_tick);
     ~video_channel();
 
     core::monitor::state state() const;
 
-    const core::stage&  stage() const;
-    core::stage&        stage();
-    const core::mixer&  mixer() const;
-    core::mixer&        mixer();
-    const core::output& output() const;
-    core::output&       output();
-
-    core::video_format_desc video_format_desc() const;
-    void                    video_format_desc(const core::video_format_desc& format_desc);
+    const std::shared_ptr<core::stage>& stage() const;
+    std::shared_ptr<core::stage>&       stage();
+    const core::mixer&                  mixer() const;
+    core::mixer&                        mixer();
+    const core::output&                 output() const;
+    core::output&                       output();
 
     spl::shared_ptr<core::frame_factory> frame_factory();
 
     int index() const;
+
+    [[nodiscard]] channel_info get_consumer_channel_info() const;
 
     std::shared_ptr<core::route> route(int index = -1, route_mode mode = route_mode::foreground);
 

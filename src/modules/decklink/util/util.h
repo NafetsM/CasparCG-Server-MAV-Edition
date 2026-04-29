@@ -100,6 +100,22 @@ static BMDDisplayMode get_decklink_video_format(core::video_format fmt)
             return bmdMode4K2160p5994;
         case core::video_format::x2160p6000:
             return bmdMode4K2160p60;
+        case core::video_format::x4kDCIp2398:
+            return bmdMode4kDCI2398;
+        case core::video_format::x4kDCIp2400:
+            return bmdMode4kDCI24;
+        case core::video_format::x4kDCIp2500:
+            return bmdMode4kDCI25;
+        case core::video_format::x4kDCIp2997:
+            return bmdMode4kDCI2997;
+        case core::video_format::x4kDCIp3000:
+            return bmdMode4kDCI30;
+        case core::video_format::x4kDCIp5000:
+            return bmdMode4kDCI50;
+        case core::video_format::x4kDCIp5994:
+            return bmdMode4kDCI5994;
+        case core::video_format::x4kDCIp6000:
+            return bmdMode4kDCI60;
         default:
             return (BMDDisplayMode)ULONG_MAX;
     }
@@ -162,6 +178,22 @@ static core::video_format get_caspar_video_format(BMDDisplayMode fmt)
             return core::video_format::x2160p5994;
         case bmdMode4K2160p60:
             return core::video_format::x2160p6000;
+        case bmdMode4kDCI2398:
+            return core::video_format::x4kDCIp2398;
+        case bmdMode4kDCI24:
+            return core::video_format::x4kDCIp2400;
+        case bmdMode4kDCI25:
+            return core::video_format::x4kDCIp2500;
+        case bmdMode4kDCI2997:
+            return core::video_format::x4kDCIp2997;
+        case bmdMode4kDCI30:
+            return core::video_format::x4kDCIp3000;
+        case bmdMode4kDCI50:
+            return core::video_format::x4kDCIp5000;
+        case bmdMode4kDCI5994:
+            return core::video_format::x4kDCIp5994;
+        case bmdMode4kDCI60:
+            return core::video_format::x4kDCIp6000;
         default:
             return core::video_format::invalid;
     }
@@ -173,45 +205,6 @@ static std::wstring get_mode_name(const com_ptr<IDeckLinkDisplayMode>& mode)
     if (SUCCEEDED(mode->GetName(&mode_name)))
         return to_string(mode_name);
     return L"Unknown";
-}
-
-template <typename T, typename F>
-com_ptr<IDeckLinkDisplayMode> get_display_mode(const T& device, BMDDisplayMode format, BMDPixelFormat pix_fmt, F flag)
-{
-    IDeckLinkDisplayMode*         m = nullptr;
-    IDeckLinkDisplayModeIterator* iter;
-    if (SUCCEEDED(device->GetDisplayModeIterator(&iter))) {
-        auto iterator = wrap_raw<com_ptr>(iter, true);
-        while (SUCCEEDED(iterator->Next(&m)) && m != nullptr && m->GetDisplayMode() != format) {
-            m->Release();
-        }
-    }
-
-    if (!m)
-        CASPAR_THROW_EXCEPTION(user_error()
-                               << msg_info("Device could not find requested video-format: " + std::to_string(format)));
-
-    com_ptr<IDeckLinkDisplayMode> mode = wrap_raw<com_ptr>(m, true);
-
-    BMDDisplayModeSupport displayModeSupport;
-
-    if (FAILED(device->DoesSupportVideoMode(mode->GetDisplayMode(), pix_fmt, flag, &displayModeSupport, nullptr)))
-        CASPAR_THROW_EXCEPTION(caspar_exception()
-                               << msg_info(L"Could not determine whether device supports requested video format: " +
-                                           get_mode_name(mode)));
-    else if (displayModeSupport == bmdDisplayModeNotSupported)
-        CASPAR_LOG(info) << L"Device may not support video-format: " << get_mode_name(mode);
-    else if (displayModeSupport == bmdDisplayModeSupportedWithConversion)
-        CASPAR_LOG(warning) << L"Device supports video-format with conversion: " << get_mode_name(mode);
-
-    return mode;
-}
-
-template <typename T, typename F>
-static com_ptr<IDeckLinkDisplayMode>
-get_display_mode(const T& device, core::video_format fmt, BMDPixelFormat pix_fmt, F flag)
-{
-    return get_display_mode(device, get_decklink_video_format(fmt), pix_fmt, flag);
 }
 
 template <typename T>
@@ -230,20 +223,25 @@ static com_ptr<IDeckLink> get_device(size_t device_index)
 {
     auto pDecklinkIterator = create_iterator();
 
-    size_t             n = 0;
-    com_ptr<IDeckLink> decklink;
-    IDeckLink*         current = nullptr;
-    while (n < device_index && pDecklinkIterator->Next(&current) == S_OK) {
-        ++n;
-        decklink = wrap_raw<com_ptr>(current);
-        current->Release();
+    IDeckLink* current = nullptr;
+    for (int n = 1; pDecklinkIterator->Next(&current) == S_OK; ++n) {
+        auto decklink = wrap_raw<com_ptr>(current, true);
+
+        // Match index
+        if (n == device_index) {
+            return decklink;
+        }
+
+        // Match persistent id
+        int64_t id         = 0;
+        auto    attributes = iface_cast<IDeckLinkProfileAttributes>(decklink);
+        attributes->GetInt(BMDDeckLinkPersistentID, &id);
+        if (id != 0 && id == static_cast<int64_t>(device_index)) {
+            return decklink;
+        }
     }
 
-    if (n != device_index || !decklink)
-        CASPAR_THROW_EXCEPTION(user_error()
-                               << msg_info("Decklink device " + std::to_string(device_index) + " not found."));
-
-    return decklink;
+    CASPAR_THROW_EXCEPTION(user_error() << msg_info("Decklink device " + std::to_string(device_index) + " not found."));
 }
 
 template <typename T>

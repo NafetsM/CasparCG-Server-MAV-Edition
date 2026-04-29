@@ -29,20 +29,19 @@
 #include <common/log.h>
 #include <common/param.h>
 #include <common/timer.h>
+#include <common/utf.h>
 
+#include <core/consumer/channel_info.h>
 #include <core/consumer/frame_consumer.h>
 #include <core/frame/frame.h>
-#include <core/mixer/audio/audio_mixer.h>
 #include <core/video_format.h>
 
+#include <boost/algorithm/string/erase.hpp>
+#include <boost/algorithm/string/predicate.hpp>
 #include <boost/property_tree/ptree.hpp>
 
 #include <tbb/concurrent_queue.h>
 
-#if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4244)
-#endif
 extern "C" {
 #define __STDC_CONSTANT_MACROS
 #define __STDC_LIMIT_MACROS
@@ -50,9 +49,6 @@ extern "C" {
 #include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
 }
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
 
 #include <memory>
 #include <vector>
@@ -64,13 +60,42 @@ namespace caspar { namespace oal {
 
 class device
 {
-    ALCdevice*  device_  = nullptr;
-    ALCcontext* context_ = nullptr;
+    ALCdevice*         device_  = nullptr;
+    ALCcontext*        context_ = nullptr;
+    const std::wstring device_name_;
 
   public:
-    device()
+    explicit device(std::wstring device_name)
+        : device_name_(std::move(device_name))
     {
-        device_ = alcOpenDevice(nullptr);
+        ALCchar* deviceName = nullptr;
+
+        if (!device_name_.empty()) {
+            ALboolean enumeration = alcIsExtensionPresent(nullptr, "ALC_ENUMERATION_EXT");
+
+            if (enumeration == AL_FALSE) {
+                // enumeration not supported
+                CASPAR_LOG(info) << L"Unable to enumerate OpenAL devices. Using system default device";
+            } else {
+                char* s;
+
+                if (alcIsExtensionPresent(nullptr, "ALC_enumerate_all_EXT") == AL_FALSE)
+                    s = (char*)alcGetString(nullptr, ALC_DEVICE_SPECIFIER);
+                else
+                    s = (char*)alcGetString(nullptr, ALC_ALL_DEVICES_SPECIFIER);
+
+                deviceName = iterate_and_find_device(s, device_name_);
+
+                if (deviceName == nullptr) {
+                    CASPAR_LOG(warning)
+                        << L"Failed to find specified OpenAL output device. Using system default device";
+                } else {
+                    CASPAR_LOG(debug) << L"Found specified OpenAL output device";
+                }
+            }
+        }
+
+        device_ = alcOpenDevice(deviceName);
 
         if (device_ == nullptr)
             CASPAR_THROW_EXCEPTION(invalid_operation() << msg_info("Failed to initialize audio device."));
@@ -96,6 +121,47 @@ class device
     }
 
     ALCdevice* get() { return device_; }
+
+  private:
+    static ALCchar* iterate_and_find_device(const char* list, const std::wstring& device_name)
+    {
+        ALCchar* result = nullptr;
+
+        // generate ascii string for comparison purposes vs what openAL provides
+        std::string short_device_name = u8(device_name);
+        boost::algorithm::erase_all(short_device_name, " ");
+
+        CASPAR_LOG(info) << L"------- OpenAL Device List -----";
+
+        if (!list) {
+            CASPAR_LOG(info) << L"No device names found";
+        } else {
+            // iterate through all device names
+            // -> buffer contains multiple null-terminated device name strings
+            ALCchar* ptr = (ALCchar*)list;
+
+            while (strlen(ptr) > 0) {
+                // log each device name, so we can see what options are available
+                CASPAR_LOG(info) << ptr;
+
+                // store matching device name address if found
+                // -> device name will be empty string if not provided
+                std::string tmpStr = ptr;
+                boost::algorithm::erase_all(tmpStr, " ");
+
+                if (boost::iequals(short_device_name, tmpStr)) {
+                    result = ptr;
+                }
+
+                // point to next device name start (or null if no more device names)
+                ptr += strlen(ptr) + 1;
+            }
+        }
+
+        CASPAR_LOG(info) << L"------ OpenAL Devices List done -----";
+
+        return result;
+    }
 };
 
 void init_device()
@@ -103,7 +169,11 @@ void init_device()
     static std::unique_ptr<device> instance;
     static std::once_flag          f;
 
-    std::call_once(f, [] { instance = std::make_unique<device>(); });
+    std::call_once(f, [&] {
+        std::wstring device_name =
+            env::properties().get(L"configuration.system-audio.producer.default-device-name", L"");
+        instance = std::make_unique<device>(device_name);
+    });
 }
 
 struct oal_consumer : public core::frame_consumer
@@ -124,7 +194,7 @@ struct oal_consumer : public core::frame_consumer
     executor executor_{L"oal_consumer"};
 
   public:
-    oal_consumer()
+    explicit oal_consumer()
     {
         init_device();
 
@@ -136,7 +206,7 @@ struct oal_consumer : public core::frame_consumer
 
     ~oal_consumer() override
     {
-        executor_.invoke([=] {
+        executor_.invoke([this] {
             if (source_ != 0u) {
                 alSourceStop(source_);
                 alDeleteSources(1, &source_);
@@ -151,14 +221,16 @@ struct oal_consumer : public core::frame_consumer
 
     // frame consumer
 
-    void initialize(const core::video_format_desc& format_desc, int channel_index) override
+    void initialize(const core::video_format_desc& format_desc,
+                    const core::channel_info&      channel_info,
+                    int                            port_index) override
     {
         format_desc_   = format_desc;
-        channel_index_ = channel_index;
+        channel_index_ = channel_info.index;
         graph_->set_text(print());
 
-        executor_.begin_invoke([=] {
-            duration_ = format_desc_.audio_cadence[0];
+        executor_.begin_invoke([this] {
+            duration_ = *std::min_element(format_desc_.audio_cadence.begin(), format_desc_.audio_cadence.end());
             buffers_.resize(8);
             alGenBuffers(static_cast<ALsizei>(buffers_.size()), buffers_.data());
             alGenSources(1, &source_);
@@ -167,15 +239,14 @@ struct oal_consumer : public core::frame_consumer
         });
     }
 
-    std::future<bool> send(core::const_frame frame) override
+    std::future<bool> send(core::video_field field, core::const_frame frame) override
     {
-        executor_.begin_invoke([=] {
-            auto dst            = std::shared_ptr<AVFrame>(av_frame_alloc(), [](AVFrame* ptr) { av_frame_free(&ptr); });
-            dst->format         = AV_SAMPLE_FMT_S16;
-            dst->sample_rate    = format_desc_.audio_sample_rate;
-            dst->channels       = 2;
-            dst->channel_layout = av_get_default_channel_layout(dst->channels);
-            dst->nb_samples     = duration_;
+        executor_.begin_invoke([=, this] {
+            auto dst         = std::shared_ptr<AVFrame>(av_frame_alloc(), [](AVFrame* ptr) { av_frame_free(&ptr); });
+            dst->format      = AV_SAMPLE_FMT_S16;
+            dst->sample_rate = format_desc_.audio_sample_rate;
+            av_channel_layout_default(&dst->ch_layout, 2);
+            dst->nb_samples = duration_;
             if (av_frame_get_buffer(dst.get(), 32) < 0) {
                 // TODO FF error
                 CASPAR_THROW_EXCEPTION(invalid_argument());
@@ -198,12 +269,11 @@ struct oal_consumer : public core::frame_consumer
                 return;
             }
 
-            auto src            = std::shared_ptr<AVFrame>(av_frame_alloc(), [](AVFrame* ptr) { av_frame_free(&ptr); });
-            src->format         = AV_SAMPLE_FMT_S32;
-            src->sample_rate    = format_desc_.audio_sample_rate;
-            src->channels       = format_desc_.audio_channels;
-            src->channel_layout = av_get_default_channel_layout(src->channels);
-            src->nb_samples     = static_cast<int>(frame.audio_data().size() / src->channels);
+            auto src         = std::shared_ptr<AVFrame>(av_frame_alloc(), [](AVFrame* ptr) { av_frame_free(&ptr); });
+            src->format      = AV_SAMPLE_FMT_S32;
+            src->sample_rate = format_desc_.audio_sample_rate;
+            av_channel_layout_default(&src->ch_layout, format_desc_.audio_channels);
+            src->nb_samples       = static_cast<int>(frame.audio_data().size() / format_desc_.audio_channels);
             src->extended_data[0] = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(frame.audio_data().data()));
             src->linesize[0]      = static_cast<int>(frame.audio_data().size() * sizeof(int32_t));
 
@@ -303,10 +373,18 @@ struct oal_consumer : public core::frame_consumer
     bool has_synchronization_clock() const override { return false; }
 
     int index() const override { return 500; }
+
+    core::monitor::state state() const override
+    {
+        static const core::monitor::state empty;
+        return empty;
+    }
 };
 
-spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wstring>&                         params,
-                                                      const std::vector<spl::shared_ptr<core::video_channel>>& channels)
+spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wstring>&     params,
+                                                      const core::video_format_repository& format_repository,
+                                                      const std::vector<spl::shared_ptr<core::video_channel>>& channels,
+                                                      const core::channel_info& channel_info)
 {
     if (params.empty() || !boost::iequals(params.at(0), L"AUDIO"))
         return core::frame_consumer::empty();
@@ -316,7 +394,9 @@ spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wst
 
 spl::shared_ptr<core::frame_consumer>
 create_preconfigured_consumer(const boost::property_tree::wptree&                      ptree,
-                              const std::vector<spl::shared_ptr<core::video_channel>>& channels)
+                              const core::video_format_repository&                     format_repository,
+                              const std::vector<spl::shared_ptr<core::video_channel>>& channels,
+                              const core::channel_info&                                channel_info)
 {
     return spl::make_shared<oal_consumer>();
 }

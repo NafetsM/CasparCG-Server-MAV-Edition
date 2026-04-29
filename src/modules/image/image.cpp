@@ -21,33 +21,19 @@
 
 #include "image.h"
 
-#define WIN32_LEAN_AND_MEAN
-#include <FreeImage.h>
-
 #include "consumer/image_consumer.h"
 #include "producer/image_producer.h"
 #include "producer/image_scroll_producer.h"
 
-#include <core/consumer/frame_consumer.h>
-#include <core/producer/frame_producer.h>
-
 #include <common/utf.h>
-
-#include <boost/algorithm/string/case_conv.hpp>
-#include <boost/property_tree/ptree.hpp>
 
 namespace caspar { namespace image {
 
-std::wstring version() { return u16(FreeImage_GetVersion()); }
-
-void init(core::module_dependencies dependencies)
+void init(const core::module_dependencies& dependencies)
 {
-    FreeImage_Initialise();
     dependencies.producer_registry->register_producer_factory(L"Image Scroll Producer", create_scroll_producer);
     dependencies.producer_registry->register_producer_factory(L"Image Producer", create_producer);
     dependencies.consumer_registry->register_consumer_factory(L"Image Consumer", create_consumer);
 }
-
-void uninit() { FreeImage_DeInitialise(); }
 
 }} // namespace caspar::image

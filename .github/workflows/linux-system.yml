@@ -1,0 +1,199 @@
+name: Build Linux with system dependencies
+
+on:
+    push:
+        # branches: [ "master" ]
+    pull_request:
+        branches: ["master"]
+
+jobs:
+    build:
+        name: ${{ matrix.container || matrix.os }} ${{ matrix.arch }} (${{matrix.family}}:${{ matrix.distribution }})
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - os: ubuntu-24.04
+                      family: ubuntu
+                      distribution: noble
+                      arch: amd64
+                      container: ""
+                      apt_prefix: sudo
+                      upload_artifacts: true
+                    - os: ubuntu-latest
+                      family: ubuntu
+                      distribution: resolute
+                      arch: amd64
+                      container: ubuntu:26.04
+                      apt_prefix: ""
+                      upload_artifacts: false
+                    - os: ubuntu-24.04-arm
+                      family: ubuntu
+                      distribution: resolute
+                      arch: arm64
+                      container: ubuntu:26.04
+                      apt_prefix: ""
+                      upload_artifacts: false
+                    - os: ubuntu-latest
+                      family: debian
+                      distribution: trixie
+                      arch: amd64
+                      container: debian:trixie # Debian 13
+                      apt_prefix: ""
+                      upload_artifacts: false # Because of CEF, this is not built correctly
+                    - os: ubuntu-latest
+                      family: debian
+                      distribution: sid
+                      arch: amd64
+                      container: debian:sid # Debian Testing
+                      apt_prefix: ""
+                      upload_artifacts: false # Because of CEF, this is not built correctly
+                    - os: ubuntu-latest
+                      family: debian
+                      distribution: trixie
+                      arch: amd64
+                      container: debian:trixie
+                      apt_prefix: ""
+                      upload_artifacts: false # Because of CEF, this is not built correctly
+                    - os: ubuntu-latest
+                      family: archlinux
+                      distribution: latest
+                      arch: amd64
+                      container: archlinux:latest
+                      apt_prefix: ""
+                      upload_artifacts: false # Not supported
+
+        runs-on: ${{ matrix.os }}
+        container: ${{ matrix.container }}
+        defaults:
+            run:
+                shell: bash
+
+        steps:
+            - name: Install git (archlinux)
+              if: ${{ matrix.family == 'archlinux' }}
+              run: pacman -Sy --noconfirm git
+
+            - uses: actions/checkout@v6
+
+            - name: Setup environment
+              id: setup-env
+              if: ${{ matrix.family == 'ubuntu' || matrix.family == 'debian' }}
+              run: |
+                  ln -s tools/linux/deb/${{ matrix.family }}-${{ matrix.distribution }}/debian ./
+
+                  # Build a version number for this build
+                  GH_REF="${GITHUB_REF##*/}"
+                  GH_REF=$(echo "$GH_REF" | sed 's/[\/]/_/g' | sed 's/ /_/g')
+
+                  VERSION_MAJOR=$(grep -oPi 'set\(CONFIG_VERSION_MAJOR \K\d+' src/CMakeLists.txt)
+                  VERSION_MINOR=$(grep -oPi 'set\(CONFIG_VERSION_MINOR \K\d+' src/CMakeLists.txt)
+                  VERSION_PATCH=$(grep -oPi 'set\(CONFIG_VERSION_BUG \K\d+' src/CMakeLists.txt)
+
+                  BUILD_VERSION="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}~${GH_REF}-${{ matrix.distribution }}+${GITHUB_SHA:0:7}"
+                  echo "BUILD_VERSION=$BUILD_VERSION" >> $GITHUB_OUTPUT
+                  echo "Building as $BUILD_VERSION"
+
+                  BUILD_FILENAME="casparcg-server-${BUILD_VERSION}"
+                  echo "BUILD_FILENAME=$BUILD_FILENAME" >> $GITHUB_OUTPUT
+
+                  # install some needed tooling
+                  $APT_PREFIX apt-get update
+                  $APT_PREFIX apt-get -y install build-essential dpkg-dev debhelper devscripts
+
+                  if [[ "${{ matrix.family }}" == "ubuntu" ]]; then
+                    $APT_PREFIX apt-get -y install software-properties-common
+                    $APT_PREFIX add-apt-repository ppa:casparcg/ppa
+                  fi
+
+                  # Put something in the changelog
+                  export DEBEMAIL="builds@casparcg.com"
+                  export DEBFULLNAME="CasparCG Builds"
+                  dch -v "$BUILD_VERSION" --create -D ${{ matrix.distribution }} --package casparcg-server-beta "Build"
+
+                  # Install build dependencies
+                  $APT_PREFIX apt-get -y build-dep .
+
+                  if [[ "${{ matrix.family }}" == "ubuntu" ]]; then
+                    # update the control file to reference the current cef version
+                    CASPARCG_CEF_VER=$(dpkg-query -W -f='${Version}' casparcg-cef-142)
+                    sed -i "s/@CASPARCG_CEF_VER@/${CASPARCG_CEF_VER}/" debian/control
+
+                    # Download required packages
+                    cd ..
+                    apt-get download casparcg-cef-142=$CASPARCG_CEF_VER
+                    apt-get download casparcg-scanner
+                  fi
+              env:
+                  CI: 1
+                  DEBIAN_FRONTEND: noninteractive
+                  APT_PREFIX: ${{ matrix.apt_prefix }}
+
+            - name: Run build
+              if: ${{ matrix.family == 'ubuntu' || matrix.family == 'debian' }}
+              run: |
+                  # Perform build
+                  debuild -b -uc -us
+              env:
+                  CI: 1
+
+            - name: Collect artifacts
+              id: artifacts
+              if: ${{ (matrix.family == 'ubuntu' || matrix.family == 'debian') && matrix.upload_artifacts }}
+              run: |
+                  mkdir -p dist
+                  mv ../*.deb dist/
+
+                  # collect some docs for the zip
+                  cp README.md dist/
+                  cp tools/linux/deb/INSTALLING dist/
+
+                  # check if a release branch, or master, or a tag
+                  if [[ "${{ github.ref_name }}" == "master" || "${{ github.ref_name }}" == "2.3.x-lts" ]]
+                  then
+                    # Only proceed if we have an sftp password
+                    if [ -n "${{ secrets.SFTP_PASSWORD }}" ]
+                    then
+                      zip -r "${{ steps.setup-env.outputs.BUILD_FILENAME }}.zip" dist
+
+                      set -x
+                      eval $(ssh-agent -s)
+                      mkdir -v -m 700 $HOME/.ssh
+                      ssh-keyscan -H ${{ secrets.SFTP_HOST }} > $HOME/.ssh/known_hosts
+                      sshpass -p '${{ secrets.SFTP_PASSWORD }}' rsync -avvz --mkpath "${{ steps.setup-env.outputs.BUILD_FILENAME }}.zip" "${{ secrets.SFTP_USERNAME }}@${{ secrets.SFTP_HOST }}:${{ secrets.SFTP_ROOT }}/${{ github.ref_name }}/${{ steps.setup-env.outputs.BUILD_FILENAME }}.zip"
+                    fi
+                  fi
+
+              env:
+                  CI: 1
+
+            - uses: actions/upload-artifact@v7
+              if: ${{ (matrix.family == 'ubuntu' || matrix.family == 'debian') && matrix.upload_artifacts }}
+              with:
+                  name: ${{ steps.setup-env.outputs.BUILD_FILENAME }}
+                  path: dist
+
+            - name: Setup environment (archlinux)
+              if: ${{ matrix.family == 'archlinux' }}
+              run: |
+                  pacman -Syu --noconfirm
+                  pacman -S --noconfirm --needed \
+                    base-devel cmake ninja pkg-config \
+                    boost boost-libs ffmpeg glew libglvnd \
+                    onetbb openal sfml \
+                    libxrandr simde
+              env:
+                  CI: 1
+
+            - name: Run build (archlinux)
+              if: ${{ matrix.family == 'archlinux' }}
+              run: |
+                  cmake -B build -S src \
+                    -DCMAKE_BUILD_TYPE=Release \
+                    -DDIAG_FONT_PATH="/usr/share/fonts/liberation/LiberationMono-Regular.ttf" \
+                    -DENABLE_HTML=OFF \
+                    -G Ninja
+
+                  cmake --build build
+              env:
+                  CI: 1

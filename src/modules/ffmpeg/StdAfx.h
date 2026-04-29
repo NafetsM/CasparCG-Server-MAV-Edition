@@ -27,10 +27,10 @@
 #include <boost/filesystem.hpp>
 #include <boost/format.hpp>
 #include <boost/lexical_cast.hpp>
-#include <boost/optional.hpp>
 #include <boost/range/algorithm/rotate.hpp>
 #include <boost/rational.hpp>
 #include <cinttypes>
+#include <common/compiler/vs/disable_silly_warnings.h>
 #include <common/diagnostics/graph.h>
 #include <common/env.h>
 #include <common/except.h>
@@ -46,7 +46,6 @@
 #include <core/frame/frame_factory.h>
 #include <core/frame/pixel_format.h>
 #include <core/fwd.h>
-#include <core/module_dependencies.h>
 #include <core/producer/frame_producer.h>
 #include <core/video_format.h>
 #include <deque>
@@ -54,14 +53,13 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <set>
 #include <string>
 #include <tbb/concurrent_queue.h>
 #include <thread>
 #include <vector>
-
-#pragma warning(push, 1)
 
 extern "C" {
 #define __STDC_CONSTANT_MACROS
@@ -80,5 +78,3 @@ extern "C" {
 #include <libavutil/timecode.h>
 #include <libswscale/swscale.h>
 }
-
-#pragma warning(pop)

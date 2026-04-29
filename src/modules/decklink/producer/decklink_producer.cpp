@@ -42,32 +42,25 @@
 #include <core/monitor/monitor.h>
 #include <core/producer/frame_producer.h>
 
-#include <tbb/concurrent_queue.h>
-
 #include <boost/algorithm/string.hpp>
-#include <boost/property_tree/ptree.hpp>
 #include <boost/range/adaptor/transformed.hpp>
 
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4244)
-#endif
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/timecode.h>
 }
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
 
 #include <boost/format.hpp>
+
+#include <mutex>
 
 #include "../decklink_api.h"
 
@@ -84,10 +77,11 @@ struct Filter
 
     Filter() {}
 
-    Filter(std::string                    filter_spec,
-           AVMediaType                    type,
-           const core::video_format_desc& format_desc,
-           com_ptr<IDeckLinkDisplayMode>  dm)
+    Filter(std::string                          filter_spec,
+           AVMediaType                          type,
+           const core::video_format_desc&       format_desc,
+           const com_ptr<IDeckLinkDisplayMode>& dm,
+           bool                                 hdr)
     {
         BMDTimeScale timeScale;
         BMDTimeValue frameDuration;
@@ -98,14 +92,12 @@ struct Filter
                 filter_spec = "null";
             }
 
-            bool                 doScale = dm->GetHeight() != format_desc.height || dm->GetWidth() != format_desc.width;
             boost::rational<int> bmdFramerate(
                 timeScale / 1000 * (dm->GetFieldDominance() == bmdProgressiveFrame ? 1 : 2), frameDuration / 1000);
-            bool doFps = bmdFramerate != format_desc.framerate;
+            bool doFps = bmdFramerate != (format_desc.framerate * format_desc.field_count);
             bool i2p   = (dm->GetFieldDominance() != bmdProgressiveFrame) && (1 == format_desc.field_count);
 
-            std::string deintStr =
-                (doScale || doFps || i2p) ? ",bwdif=mode=send_field" : ",yadif=mode=send_field_nospatial";
+            std::string deintStr = (doFps || i2p) ? ",bwdif=mode=send_field" : ",yadif=mode=send_field_nospatial";
             switch (dm->GetFieldDominance()) {
                 case bmdUpperFieldFirst:
                     filter_spec += deintStr + ":parity=tff:deint=all";
@@ -118,13 +110,9 @@ struct Filter
                     break;
             }
 
-            if (doScale) {
-                filter_spec += (boost::format(",scale=%dx%d") % format_desc.width % format_desc.height).str();
-            }
-
             if (doFps) {
-                filter_spec += (boost::format(",fps=%d/%d") % format_desc.framerate.numerator() %
-                                format_desc.framerate.denominator())
+                filter_spec += (boost::format(",fps=%d/%d") % (format_desc.time_scale * format_desc.field_count) %
+                                format_desc.duration)
                                    .str();
             }
         } else {
@@ -180,6 +168,7 @@ struct Filter
 
         FF(avfilter_graph_parse2(graph.get(), filter_spec.c_str(), &inputs, &outputs));
 
+        auto pix_fmt = (hdr ? AV_PIX_FMT_YUV422P10 : AV_PIX_FMT_UYVY422);
         for (auto cur = inputs; cur; cur = cur->next) {
             const auto filter_type = avfilter_pad_get_type(cur->filter_ctx->input_pads, cur->pad_idx);
 
@@ -193,7 +182,7 @@ struct Filter
 
                 auto args =
                     (boost::format("video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:sar=%d/%d:frame_rate=%d/%d") %
-                     dm->GetWidth() % dm->GetHeight() % AV_PIX_FMT_UYVY422 % 1 % AV_TIME_BASE % sar.numerator() %
+                     dm->GetWidth() % dm->GetHeight() % pix_fmt % 1 % AV_TIME_BASE % sar.numerator() %
                      sar.denominator() % (timeScale / 1000 * (dm->GetFieldDominance() == bmdProgressiveFrame ? 1 : 2)) %
                      (frameDuration / 1000))
                         .str();
@@ -210,7 +199,7 @@ struct Filter
 
                 auto args = (boost::format("time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=%#x") % 1 %
                              format_desc.audio_sample_rate % format_desc.audio_sample_rate % AV_SAMPLE_FMT_S32 %
-                             av_get_default_channel_layout(format_desc.audio_channels))
+                             ffmpeg::get_channel_layout_mask_for_channels(format_desc.audio_channels))
                                 .str();
                 auto name = (boost::format("in_%d") % 0).str();
 
@@ -227,31 +216,28 @@ struct Filter
             FF(avfilter_graph_create_filter(
                 &sink, avfilter_get_by_name("buffersink"), "out", nullptr, nullptr, graph.get()));
 
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4245)
-#endif
-            AVPixelFormat pix_fmts[] = {AV_PIX_FMT_UYVY422, AV_PIX_FMT_NONE};
+            AVPixelFormat pix_fmts[] = {pix_fmt, AV_PIX_FMT_NONE};
             FF(av_opt_set_int_list(sink, "pix_fmts", pix_fmts, -1, AV_OPT_SEARCH_CHILDREN));
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
         } else if (type == AVMEDIA_TYPE_AUDIO) {
             FF(avfilter_graph_create_filter(
                 &sink, avfilter_get_by_name("abuffersink"), "out", nullptr, nullptr, graph.get()));
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4245)
-#endif
-            AVSampleFormat sample_fmts[]     = {AV_SAMPLE_FMT_S32, AV_SAMPLE_FMT_NONE};
-            int64_t        channel_layouts[] = {av_get_default_channel_layout(format_desc.audio_channels), 0};
-            int            sample_rates[]    = {format_desc.audio_sample_rate, 0};
+
+            AVSampleFormat sample_fmts[]  = {AV_SAMPLE_FMT_S32, AV_SAMPLE_FMT_NONE};
+            int            sample_rates[] = {format_desc.audio_sample_rate, 0};
             FF(av_opt_set_int_list(sink, "sample_fmts", sample_fmts, -1, AV_OPT_SEARCH_CHILDREN));
-            FF(av_opt_set_int_list(sink, "channel_layouts", channel_layouts, 0, AV_OPT_SEARCH_CHILDREN));
             FF(av_opt_set_int_list(sink, "sample_rates", sample_rates, 0, AV_OPT_SEARCH_CHILDREN));
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
+
+            // TODO - we might want to force the filter to produce 16 channels
+            // But this segfaults (changing the property name causes it to fail with an error)
+            // As 16 channel packets are fed into the filter, with the filter set to the same, that is what we get out
+            /*
+            AVChannelLayout channel_layout = AV_CHANNEL_LAYOUT_STEREO;
+            av_channel_layout_default(&channel_layout, format_desc.audio_channels);
+
+            FF(av_opt_set_chlayout(sink, "ch_layouts", &channel_layout, AV_OPT_SEARCH_CHILDREN));
+            av_channel_layout_uninit(&channel_layout);
+             */
+
         } else {
             CASPAR_THROW_EXCEPTION(ffmpeg_error_t()
                                    << boost::errinfo_errno(EINVAL) << msg_info_t("invalid output media type"));
@@ -279,6 +265,166 @@ struct Filter
     }
 };
 
+struct Decoder
+{
+    Decoder(const Decoder&) = delete;
+
+    bool hdr_ = false;
+
+  public:
+    std::shared_ptr<AVCodecContext> ctx;
+
+    Decoder() = default;
+
+    explicit Decoder(bool hdr, const com_ptr<IDeckLinkDisplayMode>& mode)
+        : hdr_(hdr)
+    {
+        const auto codec = avcodec_find_decoder(AV_CODEC_ID_V210);
+        if (!codec) {
+            FF_RET(AVERROR_DECODER_NOT_FOUND, "avcodec_find_decoder");
+        }
+
+        ctx = std::shared_ptr<AVCodecContext>(avcodec_alloc_context3(codec),
+                                              [](AVCodecContext* ptr) { avcodec_free_context(&ptr); });
+        if (!ctx) {
+            FF_RET(AVERROR(ENOMEM), "avcodec_alloc_context3");
+        }
+
+        auto params = std::shared_ptr<AVCodecParameters>(avcodec_parameters_alloc(),
+                                                         [](AVCodecParameters* ptr) { avcodec_parameters_free(&ptr); });
+        if (!params) {
+            FF_RET(AVERROR(ENOMEM), "avcodec_parameters_alloc");
+        }
+        params->width      = mode->GetWidth();
+        params->height     = mode->GetHeight();
+        params->codec_type = AVMEDIA_TYPE_VIDEO;
+        params->codec_id   = AV_CODEC_ID_V210;
+        params->format     = AV_PIX_FMT_YUV422P10;
+
+        FF(avcodec_parameters_to_context(ctx.get(), params.get()));
+
+        // int thread_count = env::properties().get(L"configuration.ffmpeg.producer.threads", 0);
+        FF(av_opt_set_image_size(ctx.get(), "video_size", mode->GetWidth(), mode->GetHeight(), 0));
+        FF(avcodec_open2(ctx.get(), codec, nullptr));
+    }
+
+    std::shared_ptr<AVFrame> decode(IDeckLinkVideoInputFrame* video, const com_ptr<IDeckLinkDisplayMode>& mode)
+    {
+        void* video_bytes = nullptr;
+        if (SUCCEEDED(video->GetBytes(&video_bytes)) && video_bytes) {
+            video->AddRef();
+
+            auto frame = std::shared_ptr<AVFrame>(av_frame_alloc(), [video](AVFrame* ptr) {
+                video->Release();
+                av_frame_free(&ptr);
+            });
+            if (!frame)
+                FF_RET(AVERROR(ENOMEM), "av_frame_alloc");
+
+            if (hdr_) {
+                const auto size = video->GetRowBytes() * video->GetHeight();
+                AVPacket   packet;
+                av_init_packet(&packet);
+                packet.data = reinterpret_cast<uint8_t*>(video_bytes);
+                packet.size = size;
+                FF(avcodec_send_packet(ctx.get(), &packet));
+                FF(avcodec_receive_frame(ctx.get(), frame.get()));
+            } else {
+                frame->format      = AV_PIX_FMT_UYVY422;
+                frame->width       = video->GetWidth();
+                frame->height      = video->GetHeight();
+                frame->data[0]     = reinterpret_cast<uint8_t*>(video_bytes);
+                frame->linesize[0] = video->GetRowBytes();
+#if LIBAVCODEC_VERSION_MAJOR < 61
+                frame->key_frame = 1;
+#else
+                frame->flags |= AV_FRAME_FLAG_KEY;
+#endif
+            }
+
+#if LIBAVCODEC_VERSION_MAJOR < 61
+            frame->interlaced_frame = mode->GetFieldDominance() != bmdProgressiveFrame;
+            frame->top_field_first  = mode->GetFieldDominance() == bmdUpperFieldFirst ? 1 : 0;
+#else
+            frame->flags |= mode->GetFieldDominance() != bmdProgressiveFrame ? AV_FRAME_FLAG_INTERLACED : 0;
+            frame->flags |= mode->GetFieldDominance() == bmdUpperFieldFirst ? AV_FRAME_FLAG_TOP_FIELD_FIRST : 0;
+#endif
+
+            return frame;
+        }
+        return nullptr;
+    }
+};
+
+core::color_space get_color_space(IDeckLinkVideoInputFrame* video)
+{
+    IDeckLinkVideoFrameMetadataExtensions* md = nullptr;
+
+    if (SUCCEEDED(video->QueryInterface(IID_IDeckLinkVideoFrameMetadataExtensions, (void**)&md))) {
+        auto     metadata = wrap_raw<com_ptr>(md, true);
+        LONGLONG color_space;
+        if (SUCCEEDED(md->GetInt(bmdDeckLinkFrameMetadataColorspace, &color_space))) {
+            if (color_space == bmdColorspaceRec2020) {
+                return core::color_space::bt2020;
+            } else if (color_space == bmdColorspaceRec601) {
+                return core::color_space::bt601;
+            }
+        }
+    }
+
+    return core::color_space::bt709;
+}
+
+com_ptr<IDeckLinkDisplayMode> get_display_mode(const com_iface_ptr<IDeckLinkInput>& device,
+                                               BMDDisplayMode                       format,
+                                               BMDPixelFormat                       pix_fmt,
+                                               BMDSupportedVideoModeFlags           flag)
+{
+    IDeckLinkDisplayMode*         m = nullptr;
+    IDeckLinkDisplayModeIterator* iter;
+    if (SUCCEEDED(device->GetDisplayModeIterator(&iter))) {
+        auto iterator = wrap_raw<com_ptr>(iter, true);
+        while (SUCCEEDED(iterator->Next(&m)) && m != nullptr && m->GetDisplayMode() != format) {
+            m->Release();
+        }
+    }
+
+    if (!m)
+        CASPAR_THROW_EXCEPTION(user_error()
+                               << msg_info("Device could not find requested video-format: " + std::to_string(format)));
+
+    com_ptr<IDeckLinkDisplayMode> mode = wrap_raw<com_ptr>(m, true);
+
+    BMDDisplayMode actualMode = bmdModeUnknown;
+    BOOL           supported  = false;
+
+    if (FAILED(device->DoesSupportVideoMode(bmdVideoConnectionUnspecified,
+                                            mode->GetDisplayMode(),
+                                            pix_fmt,
+                                            bmdNoVideoInputConversion,
+                                            flag,
+                                            &actualMode,
+                                            &supported)))
+        CASPAR_THROW_EXCEPTION(caspar_exception()
+                               << msg_info(L"Could not determine whether device supports requested video format: " +
+                                           get_mode_name(mode)));
+    else if (!supported)
+        CASPAR_LOG(info) << L"Device may not support video-format: " << get_mode_name(mode);
+    else if (actualMode != bmdModeUnknown)
+        CASPAR_LOG(warning) << L"Device supports video-format with conversion: " << get_mode_name(mode);
+
+    return mode;
+}
+static com_ptr<IDeckLinkDisplayMode> get_display_mode(const com_iface_ptr<IDeckLinkInput>& device,
+                                                      core::video_format                   fmt,
+                                                      BMDPixelFormat                       pix_fmt,
+                                                      BMDSupportedVideoModeFlags           flag)
+{
+    return get_display_mode(device, get_decklink_video_format(fmt), pix_fmt, flag);
+}
+
+BMDPixelFormat get_pixel_format2(bool hdr) { return hdr ? bmdFormat10BitYUV : bmdFormat8BitYUV; }
+
 class decklink_producer : public IDeckLinkInputCallback
 {
     const int                           device_index_;
@@ -287,24 +433,31 @@ class decklink_producer : public IDeckLinkInputCallback
     spl::shared_ptr<diagnostics::graph> graph_;
     caspar::timer                       tick_timer_;
 
-    com_ptr<IDeckLink>                 decklink_   = get_device(device_index_);
-    com_iface_ptr<IDeckLinkInput>      input_      = iface_cast<IDeckLinkInput>(decklink_);
-    com_iface_ptr<IDeckLinkAttributes> attributes_ = iface_cast<IDeckLinkAttributes>(decklink_);
+    com_ptr<IDeckLink>                        decklink_   = get_device(device_index_);
+    com_iface_ptr<IDeckLinkInput>             input_      = iface_cast<IDeckLinkInput>(decklink_);
+    com_iface_ptr<IDeckLinkProfileAttributes> attributes_ = iface_cast<IDeckLinkProfileAttributes>(decklink_);
 
     const std::wstring model_name_ = get_model_name(decklink_);
 
     core::video_format_desc              format_desc_;
     std::vector<int>                     audio_cadence_ = format_desc_.audio_cadence;
     spl::shared_ptr<core::frame_factory> frame_factory_;
+    const core::video_format_repository  format_repository_;
+
+    int64_t frame_count_ = 0;
 
     double in_sync_  = 0.0;
     double out_sync_ = 0.0;
 
     bool freeze_on_lost_;
     bool has_signal_;
+    bool hdr_;
 
-    tbb::concurrent_bounded_queue<core::draw_frame> frame_buffer_;
-    core::draw_frame                                last_frame_;
+    core::draw_frame last_frame_;
+
+    int                                                        buffer_capacity_ = 4;
+    std::deque<std::pair<core::draw_frame, core::video_field>> buffer_;
+    mutable std::mutex                                         buffer_mutex_;
 
     std::exception_ptr exception_;
 
@@ -318,34 +471,39 @@ class decklink_producer : public IDeckLinkInputCallback
     Filter video_filter_;
     Filter audio_filter_;
 
+    Decoder video_decoder_;
+
   public:
-    decklink_producer(const core::video_format_desc&              format_desc,
+    decklink_producer(core::video_format_desc                     format_desc,
                       int                                         device_index,
                       const spl::shared_ptr<core::frame_factory>& frame_factory,
-                      const std::string&                          vfilter,
-                      const std::string&                          afilter,
+                      const core::video_format_repository&        format_repository,
+                      std::string                                 vfilter,
+                      std::string                                 afilter,
                       const std::wstring&                         format,
-                      bool                                        freeze_on_lost)
+                      bool                                        freeze_on_lost,
+                      bool                                        hdr)
         : device_index_(device_index)
-        , format_desc_(format_desc)
+        , format_desc_(std::move(format_desc))
         , frame_factory_(frame_factory)
+        , format_repository_(format_repository)
         , freeze_on_lost_(freeze_on_lost)
+        , hdr_(hdr)
         , input_format(format_desc_)
-        , vfilter_(vfilter)
-        , afilter_(afilter)
+        , vfilter_(std::move(vfilter))
+        , afilter_(std::move(afilter))
     {
         // use user-provided format if available, or choose the channel's output format
         if (!format.empty()) {
-            input_format = core::video_format_desc(format);
+            input_format = format_repository.find(format);
         }
 
-        mode_         = get_display_mode(input_, input_format.format, bmdFormat8BitYUV, bmdVideoOutputFlagDefault);
-        video_filter_ = Filter(vfilter_, AVMEDIA_TYPE_VIDEO, format_desc_, mode_);
-        audio_filter_ = Filter(afilter_, AVMEDIA_TYPE_AUDIO, format_desc_, mode_);
+        mode_ = get_display_mode(input_, input_format.format, get_pixel_format2(hdr_), bmdSupportedVideoModeDefault);
+        video_filter_  = Filter(vfilter_, AVMEDIA_TYPE_VIDEO, format_desc_, mode_, hdr_);
+        audio_filter_  = Filter(afilter_, AVMEDIA_TYPE_AUDIO, format_desc_, mode_, hdr_);
+        video_decoder_ = Decoder(hdr_, mode_);
 
         boost::range::rotate(audio_cadence_, std::end(audio_cadence_) - 1);
-
-        frame_buffer_.set_capacity(3);
 
         graph_->set_color("tick-time", diagnostics::color(0.0f, 0.6f, 0.9f));
         graph_->set_color("late-frame", diagnostics::color(0.6f, 0.3f, 0.3f));
@@ -368,7 +526,7 @@ class decklink_producer : public IDeckLinkInputCallback
             flags = 0;
         }
 
-        if (FAILED(input_->EnableVideoInput(mode_->GetDisplayMode(), bmdFormat8BitYUV, flags))) {
+        if (FAILED(input_->EnableVideoInput(mode_->GetDisplayMode(), get_pixel_format2(hdr_), flags))) {
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info(print() + L" Could not enable video input.")
                                                       << boost::errinfo_api_function("EnableVideoInput"));
         }
@@ -402,8 +560,8 @@ class decklink_producer : public IDeckLinkInputCallback
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, LPVOID*) override { return E_NOINTERFACE; }
-    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
-    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    ULONG STDMETHODCALLTYPE   AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE   Release() override { return 1; }
 
     HRESULT STDMETHODCALLTYPE VideoInputFormatChanged(BMDVideoInputFormatChangedEvents notificationEvents,
                                                       IDeckLinkDisplayMode*            newDisplayMode,
@@ -413,7 +571,15 @@ class decklink_producer : public IDeckLinkInputCallback
             auto newMode = newDisplayMode->GetDisplayMode();
             auto fmt     = get_caspar_video_format(newMode);
 
-            auto new_fmt = core::video_format_desc(fmt);
+            if (fmt == input_format.format) {
+                // This gets called often if the enabled pixel format doesn't match the signal
+                // https://forum.blackmagicdesign.com/viewtopic.php?f=12&t=144234 So if the video format hasn't actually
+                // changed, then we can ignore this event. In the future we may wish to respect this in order to unpack
+                // the pixels ourselves
+                return S_OK;
+            }
+
+            auto new_fmt = format_repository_.find_format(fmt);
 
             CASPAR_LOG(info) << print() << L" Input format changed from " << input_format.name << L" to "
                              << new_fmt.name;
@@ -422,15 +588,16 @@ class decklink_producer : public IDeckLinkInputCallback
 
             // reinitializing filters because not all filters can handle on-the-fly format changes
             input_format = new_fmt;
-            mode_        = get_display_mode(input_, newMode, bmdFormat8BitYUV, bmdVideoOutputFlagDefault);
+            mode_        = get_display_mode(input_, newMode, get_pixel_format2(hdr_), bmdSupportedVideoModeDefault);
 
             graph_->set_text(print());
 
-            video_filter_ = Filter(vfilter_, AVMEDIA_TYPE_VIDEO, format_desc_, mode_);
-            audio_filter_ = Filter(afilter_, AVMEDIA_TYPE_AUDIO, format_desc_, mode_);
+            video_filter_ = Filter(vfilter_, AVMEDIA_TYPE_VIDEO, format_desc_, mode_, hdr_);
+            audio_filter_ = Filter(afilter_, AVMEDIA_TYPE_AUDIO, format_desc_, mode_, hdr_);
 
             // reinitializing video input with the new display mode
-            if (FAILED(input_->EnableVideoInput(newMode, bmdFormat8BitYUV, bmdVideoInputEnableFormatDetection))) {
+            if (FAILED(
+                    input_->EnableVideoInput(newMode, get_pixel_format2(hdr_), bmdVideoInputEnableFormatDetection))) {
                 CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info(print() + L" Unable to enable video input.")
                                                           << boost::errinfo_api_function("EnableVideoInput"));
             }
@@ -458,71 +625,59 @@ class decklink_producer : public IDeckLinkInputCallback
 
         CASPAR_SCOPE_EXIT
         {
+            size_t buffer_size = 0;
+            {
+                std::lock_guard<std::mutex> lock(buffer_mutex_);
+                buffer_size = buffer_.size();
+            }
+
             {
                 std::lock_guard<std::mutex> lock(state_mutex_);
                 state_["file/name"]              = model_name_;
                 state_["file/path"]              = device_index_;
+                state_["file/format"]            = format_desc_.name;
                 state_["file/audio/sample-rate"] = format_desc_.audio_sample_rate;
                 state_["file/audio/channels"]    = format_desc_.audio_channels;
                 state_["file/fps"]               = format_desc_.fps;
                 state_["profiler/time"]          = {frame_timer.elapsed(), format_desc_.fps};
-                state_["buffer"]                 = {frame_buffer_.size(), frame_buffer_.capacity()};
+                state_["buffer"]                 = {static_cast<int>(buffer_size), buffer_capacity_};
                 state_["has_signal"]             = has_signal_;
 
                 if (video) {
-                    state_["file/video/width"]  = video->GetWidth();
-                    state_["file/video/height"] = video->GetHeight();
+                    state_["file/video/width"]  = static_cast<int>(video->GetWidth());
+                    state_["file/video/height"] = static_cast<int>(video->GetHeight());
                 }
             }
 
             graph_->set_value("frame-time", frame_timer.elapsed() * format_desc_.fps * 0.5);
-            graph_->set_value("output-buffer",
-                              static_cast<float>(frame_buffer_.size()) / static_cast<float>(frame_buffer_.capacity()));
+            graph_->set_value("output-buffer", static_cast<float>(buffer_size) / static_cast<float>(buffer_capacity_));
         };
 
         try {
-            graph_->set_value("tick-time", tick_timer_.elapsed() * format_desc_.fps * 0.5);
+            graph_->set_value("tick-time", tick_timer_.elapsed() * format_desc_.hz * 0.5);
             tick_timer_.restart();
 
-            BMDTimeValue in_video_pts = 0LL;
-            BMDTimeValue in_audio_pts = 0LL;
-
-            // If the video is delayed too much, audio only will be delivered
-            // we don't want audio only since the buffer is small and we keep avcodec
-            // very busy processing all the (unnecessary) packets. Also, because there is
-            // no audio, the sync values will be incorrect.
-            if (!audio) {
-                return S_OK;
-            }
+            BMDTimeValue      in_video_pts = 0LL;
+            BMDTimeValue      in_audio_pts = 0LL;
+            core::color_space color_space  = core::color_space::bt709;
 
             if (video) {
                 const auto flags = video->GetFlags();
                 has_signal_      = !(flags & bmdFrameHasNoInputSource);
                 if (freeze_on_lost_ && !has_signal_) {
+                    frame_count_ = 0;
                     return S_OK;
                 }
 
-                auto src    = std::shared_ptr<AVFrame>(av_frame_alloc(), [](AVFrame* ptr) { av_frame_free(&ptr); });
-                src->format = AV_PIX_FMT_UYVY422;
-                src->width  = video->GetWidth();
-                src->height = video->GetHeight();
-                src->interlaced_frame = mode_->GetFieldDominance() != bmdProgressiveFrame;
-                src->top_field_first  = mode_->GetFieldDominance() == bmdUpperFieldFirst ? 1 : 0;
-                src->key_frame        = 1;
+                color_space = get_color_space(video);
+                auto src    = video_decoder_.decode(video, mode_);
 
-                void* video_bytes = nullptr;
-                if (SUCCEEDED(video->GetBytes(&video_bytes)) && video_bytes) {
-                    video->AddRef();
-                    src = std::shared_ptr<AVFrame>(src.get(), [src, video](AVFrame* ptr) { video->Release(); });
+                BMDTimeValue duration;
+                if (SUCCEEDED(video->GetStreamTime(&in_video_pts, &duration, AV_TIME_BASE))) {
+                    src->pts = in_video_pts;
+                }
 
-                    src->data[0]     = reinterpret_cast<uint8_t*>(video_bytes);
-                    src->linesize[0] = video->GetRowBytes();
-
-                    BMDTimeValue duration;
-                    if (SUCCEEDED(video->GetStreamTime(&in_video_pts, &duration, AV_TIME_BASE))) {
-                        src->pts = in_video_pts;
-                    }
-
+                if (src) {
                     if (video_filter_.video_source) {
                         FF(av_buffersrc_write_frame(video_filter_.video_source, src.get()));
                     }
@@ -533,9 +688,9 @@ class decklink_producer : public IDeckLinkInputCallback
             }
 
             if (audio) {
-                auto src      = std::shared_ptr<AVFrame>(av_frame_alloc(), [](AVFrame* ptr) { av_frame_free(&ptr); });
-                src->format   = AV_SAMPLE_FMT_S32;
-                src->channels = format_desc_.audio_channels;
+                auto src    = std::shared_ptr<AVFrame>(av_frame_alloc(), [](AVFrame* ptr) { av_frame_free(&ptr); });
+                src->format = AV_SAMPLE_FMT_S32;
+                av_channel_layout_default(&src->ch_layout, format_desc_.audio_channels);
                 src->sample_rate = format_desc_.audio_sample_rate;
 
                 void* audio_bytes = nullptr;
@@ -544,7 +699,7 @@ class decklink_producer : public IDeckLinkInputCallback
                     src = std::shared_ptr<AVFrame>(src.get(), [src, audio](AVFrame* ptr) { audio->Release(); });
                     src->nb_samples  = audio->GetSampleFrameCount();
                     src->data[0]     = reinterpret_cast<uint8_t*>(audio_bytes);
-                    src->linesize[0] = src->nb_samples * src->channels *
+                    src->linesize[0] = src->nb_samples * format_desc_.audio_channels *
                                        av_get_bytes_per_sample(static_cast<AVSampleFormat>(src->format));
 
                     if (SUCCEEDED(audio->GetPacketTime(&in_audio_pts, format_desc_.audio_sample_rate))) {
@@ -560,6 +715,7 @@ class decklink_producer : public IDeckLinkInputCallback
                 }
             }
 
+            av_buffersink_set_frame_size(audio_filter_.sink, audio_cadence_[0]);
             while (true) {
                 {
                     auto av_video = alloc_frame();
@@ -572,7 +728,6 @@ class decklink_producer : public IDeckLinkInputCallback
                         return S_OK;
                     }
 
-                    audio_filter_.sink->inputs[0]->min_samples = audio_cadence_[0];
                     if (av_buffersink_get_frame_flags(audio_filter_.sink, av_audio.get(), AV_BUFFERSINK_FLAG_PEEK) <
                         0) {
                         return S_OK;
@@ -594,7 +749,7 @@ class decklink_producer : public IDeckLinkInputCallback
                 auto in_sync = static_cast<double>(in_video_pts) / AV_TIME_BASE -
                                static_cast<double>(in_audio_pts) / format_desc_.audio_sample_rate;
                 auto out_sync = static_cast<double>(av_video->pts * video_tb.num) / video_tb.den -
-                                static_cast<double>(av_audio->pts * video_tb.num) / audio_tb.den;
+                                static_cast<double>(av_audio->pts * audio_tb.num) / audio_tb.den;
 
                 if (std::abs(in_sync - in_sync_) > 0.01) {
                     CASPAR_LOG(warning) << print() << " in-sync changed: " << in_sync;
@@ -606,15 +761,47 @@ class decklink_producer : public IDeckLinkInputCallback
                 }
                 out_sync_ = out_sync;
 
+                // If filter output sync has drifted too far from input sync, recreate the filters to resync.
+                // This usually happens after signal loss/regain from receiving incomplete frames.
+                const double frame_duration_threshold = 1.5 / input_format.hz;
+                const double sync_drift               = std::abs(out_sync - in_sync);
+                if (sync_drift > frame_duration_threshold) {
+                    CASPAR_LOG(warning) << print() << " Excessive A/V sync drift detected ("
+                                        << static_cast<int>(sync_drift * 1000) << "ms), recreating filters to resync";
+
+                    // Recreate filters to clear all buffered data
+                    video_filter_ = Filter(vfilter_, AVMEDIA_TYPE_VIDEO, format_desc_, mode_, hdr_);
+                    audio_filter_ = Filter(afilter_, AVMEDIA_TYPE_AUDIO, format_desc_, mode_, hdr_);
+
+                    in_sync_  = 0.0;
+                    out_sync_ = 0.0;
+
+                    // Skip this iteration and start fresh
+                    return S_OK;
+                }
+
                 graph_->set_value("in-sync", in_sync * 2.0 + 0.5);
                 graph_->set_value("out-sync", out_sync * 2.0 + 0.5);
 
-                auto frame = core::draw_frame(make_frame(this, *frame_factory_, av_video, av_audio));
-                if (!frame_buffer_.try_push(frame)) {
-                    core::draw_frame dummy;
-                    frame_buffer_.try_pop(dummy);
-                    frame_buffer_.try_push(frame);
-                    graph_->set_tag(diagnostics::tag_severity::WARNING, "dropped-frame");
+                auto frame = core::draw_frame(make_frame(this, *frame_factory_, av_video, av_audio, color_space));
+                auto field = core::video_field::progressive;
+                if (format_desc_.field_count == 2) {
+                    field = frame_count_ % 2 == 0 ? core::video_field::a : core::video_field::b;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(buffer_mutex_);
+
+                    buffer_.emplace_back(std::make_pair(frame, field));
+                    frame_count_++;
+
+                    if (buffer_.size() > buffer_capacity_) {
+                        buffer_.pop_front();
+                        // If interlaced, pop a second frame, to drop a whole source frame.
+                        if (format_desc_.field_count == 2)
+                            buffer_.pop_front();
+                        graph_->set_tag(diagnostics::tag_severity::WARNING, "dropped-frame");
+                    }
                 }
 
                 boost::range::rotate(audio_cadence_, std::end(audio_cadence_) - 1);
@@ -627,34 +814,54 @@ class decklink_producer : public IDeckLinkInputCallback
         return S_OK;
     }
 
-    core::draw_frame get_frame(bool use_last_frame)
+    core::draw_frame get_frame(const core::video_field field, bool use_last_frame)
     {
         if (exception_ != nullptr) {
             std::rethrow_exception(exception_);
         }
 
         core::draw_frame frame;
+        bool             wrong_field = false;
+        {
+            std::lock_guard<std::mutex> lock(buffer_mutex_);
+            if (!buffer_.empty()) {
+                auto& candidate = buffer_.front();
+                if (candidate.second == field || candidate.second == core::video_field::progressive) {
+                    frame = std::move(candidate.first);
+                    buffer_.pop_front();
+                } else {
+                    wrong_field = true;
+                }
+            } else {
+                graph_->set_tag(diagnostics::tag_severity::WARNING, "late-frame");
+            }
 
-        if (!frame_buffer_.try_pop(frame)) {
-            if (freeze_on_lost_ || use_last_frame)
-                frame = last_frame_;
-            graph_->set_tag(diagnostics::tag_severity::WARNING, "late-frame");
-        } else {
-            last_frame_ = frame;
+            graph_->set_value("output-buffer",
+                              static_cast<float>(buffer_.size()) / static_cast<float>(buffer_capacity_));
         }
 
-        graph_->set_value("output-buffer",
-                          static_cast<float>(frame_buffer_.size()) / static_cast<float>(frame_buffer_.capacity()));
+        if (wrong_field) {
+            return last_frame_;
+        } else if (!frame && (freeze_on_lost_ || use_last_frame)) {
+            return last_frame_;
+        } else {
+            if (frame) {
+                last_frame_ = frame;
+            }
+            return frame;
+        }
+    }
 
-        return frame;
+    bool is_ready()
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        return !buffer_.empty() || last_frame_;
     }
 
     std::wstring print() const
     {
         return model_name_ + L" [" + std::to_wstring(device_index_) + L"|" + input_format.name + L"]";
     }
-
-    boost::rational<int> get_out_framerate() const { return format_desc_.framerate; }
 
     core::monitor::state state() const
     {
@@ -672,27 +879,36 @@ class decklink_producer_proxy : public core::frame_producer
   public:
     explicit decklink_producer_proxy(const core::video_format_desc&              format_desc,
                                      const spl::shared_ptr<core::frame_factory>& frame_factory,
+                                     const core::video_format_repository&        format_repository,
                                      int                                         device_index,
                                      const std::string&                          vfilter,
                                      const std::string&                          afilter,
                                      uint32_t                                    length,
                                      const std::wstring&                         format,
-                                     bool                                        freeze_on_lost)
+                                     bool                                        freeze_on_lost,
+                                     bool                                        hdr)
         : length_(length)
         , executor_(L"decklink_producer[" + std::to_wstring(device_index) + L"]")
     {
         auto ctx = core::diagnostics::call_context::for_thread();
-        executor_.invoke([=] {
+        executor_.invoke([=, this] {
             core::diagnostics::call_context::for_thread() = ctx;
             com_initialize();
-            producer_.reset(new decklink_producer(
-                format_desc, device_index, frame_factory, vfilter, afilter, format, freeze_on_lost));
+            producer_.reset(new decklink_producer(format_desc,
+                                                  device_index,
+                                                  frame_factory,
+                                                  format_repository,
+                                                  vfilter,
+                                                  afilter,
+                                                  format,
+                                                  freeze_on_lost,
+                                                  hdr));
         });
     }
 
-    ~decklink_producer_proxy()
+    ~decklink_producer_proxy() override
     {
-        executor_.invoke([=] {
+        executor_.invoke([this] {
             producer_.reset();
             com_uninitialize();
         });
@@ -702,19 +918,25 @@ class decklink_producer_proxy : public core::frame_producer
 
     // frame_producer
 
-    core::draw_frame receive_impl(int nb_samples) override { return producer_->get_frame(false); }
+    core::draw_frame receive_impl(const core::video_field field, int nb_samples) override
+    {
+        return producer_->get_frame(field, false);
+    }
 
-    core::draw_frame first_frame() override { return receive_impl(0); }
+    core::draw_frame first_frame(const core::video_field field) override { return receive_impl(field, 0); }
 
-    core::draw_frame last_frame() override { return core::draw_frame::still(producer_->get_frame(true)); }
+    core::draw_frame last_frame(const core::video_field field) override
+    {
+        return core::draw_frame::still(producer_->get_frame(field, true));
+    }
+
+    bool is_ready() override { return producer_->is_ready(); }
 
     uint32_t nb_frames() const override { return length_; }
 
     std::wstring print() const override { return producer_->print(); }
 
     std::wstring name() const override { return L"decklink"; }
-
-    boost::rational<int> get_out_framerate() const { return producer_->get_out_framerate(); }
 };
 
 spl::shared_ptr<core::frame_producer> create_producer(const core::frame_producer_dependencies& dependencies,
@@ -729,6 +951,8 @@ spl::shared_ptr<core::frame_producer> create_producer(const core::frame_producer
 
     auto freeze_on_lost = contains_param(L"FREEZE_ON_LOST", params);
 
+    auto hdr = contains_param(L"10BIT", params);
+
     auto format_str = get_param(L"FORMAT", params);
 
     auto filter_str = get_param(L"FILTER", params);
@@ -741,14 +965,15 @@ spl::shared_ptr<core::frame_producer> create_producer(const core::frame_producer
     auto vfilter = boost::to_lower_copy(get_param(L"VF", params, filter_str));
     auto afilter = boost::to_lower_copy(get_param(L"AF", params, get_param(L"FILTER", params, L"")));
 
-    auto producer = spl::make_shared<decklink_producer_proxy>(dependencies.format_desc,
-                                                              dependencies.frame_factory,
-                                                              device_index,
-                                                              u8(vfilter),
-                                                              u8(afilter),
-                                                              length,
-                                                              format_str,
-                                                              freeze_on_lost);
-    return core::create_destroy_proxy(producer);
+    return spl::make_shared<decklink_producer_proxy>(dependencies.format_desc,
+                                                     dependencies.frame_factory,
+                                                     dependencies.format_repository,
+                                                     device_index,
+                                                     u8(vfilter),
+                                                     u8(afilter),
+                                                     length,
+                                                     format_str,
+                                                     freeze_on_lost,
+                                                     hdr);
 }
 }} // namespace caspar::decklink

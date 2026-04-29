@@ -21,13 +21,31 @@
 
 #pragma once
 
+#ifdef USE_SIMDE
+#define SIMDE_ENABLE_NATIVE_ALIASES
+#include <simde/x86/ssse3.h>
+#else
 #ifdef _MSC_VER
 #include <intrin.h>
+#include <tbb/scalable_allocator.h>
 #else
 #include <tmmintrin.h>
 #endif
+#endif
 
 namespace caspar {
+
+#ifdef _MSC_VER
+static std::shared_ptr<void> create_aligned_buffer(size_t size, size_t alignment = 64)
+{
+    return std::shared_ptr<void>(scalable_aligned_malloc(size, alignment), scalable_aligned_free);
+}
+#else
+static std::shared_ptr<void> create_aligned_buffer(size_t size, size_t alignment = 64)
+{
+    return std::shared_ptr<void>(aligned_alloc(alignment, size), free);
+}
+#endif
 
 static void* aligned_memshfl(void* dest, const void* source, size_t count, int m1, int m2, int m3, int m4)
 {

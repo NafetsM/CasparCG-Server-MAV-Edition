@@ -46,7 +46,7 @@ struct lock_container::impl
                 CASPAR_LOG(info) << lifecycle_key_ << " acquired";
 
                 {
-                    std::shared_ptr<void> obj(nullptr, [=](void*) { do_release_lock(weak_ptr); });
+                    std::shared_ptr<void> obj(nullptr, [this, weak_ptr](void*) { do_release_lock(weak_ptr); });
                     conn->add_lifecycle_bound_object(lifecycle_key_, obj);
                 }
             }
@@ -75,7 +75,7 @@ struct lock_container::impl
             auto ptr = conn.lock();
             if (ptr) {
                 ptr->remove_lifecycle_bound_object(
-                    lifecycle_key_); // this calls do_relase_lock, which takes a write-lock
+                    lifecycle_key_); // this calls do_release_lock, which takes a write-lock
                 // TODO: invoke callback
             }
         }
@@ -83,7 +83,7 @@ struct lock_container::impl
 
     void release_lock(client_connection<wchar_t>::ptr conn)
     {
-        conn->remove_lifecycle_bound_object(lifecycle_key_); // this calls do_relase_lock, which takes a write-lock
+        conn->remove_lifecycle_bound_object(lifecycle_key_); // this calls do_release_lock, which takes a write-lock
     }
 
   private:

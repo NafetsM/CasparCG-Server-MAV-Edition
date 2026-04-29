@@ -52,16 +52,9 @@
 
 #include <ffmpeg/util/av_util.h>
 
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4244)
-#endif
 extern "C" {
 #include <libavformat/avformat.h>
 }
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
 
 #include "../util/ndi.h"
 
@@ -76,7 +69,7 @@ struct newtek_ndi_producer : public core::frame_producer
 
     spl::shared_ptr<core::frame_factory> frame_factory_;
     core::video_format_desc              format_desc_;
-    NDIlib_v3*                           ndi_lib_;
+    NDIlib_v6*                           ndi_lib_;
     NDIlib_framesync_instance_t          ndi_framesync_;
     NDIlib_recv_instance_t               ndi_recv_instance_;
     spl::shared_ptr<diagnostics::graph>  graph_;
@@ -118,8 +111,8 @@ struct newtek_ndi_producer : public core::frame_producer
     ~newtek_ndi_producer()
     {
         executor_.stop();
-        ndi_lib_->NDIlib_framesync_destroy(ndi_framesync_);
-        ndi_lib_->NDIlib_recv_destroy(ndi_recv_instance_);
+        ndi_lib_->framesync_destroy(ndi_framesync_);
+        ndi_lib_->recv_destroy(ndi_recv_instance_);
     }
 
     std::wstring print() const override
@@ -129,8 +122,9 @@ struct newtek_ndi_producer : public core::frame_producer
 
     std::wstring name() const override { return L"ndi"; }
 
-    core::draw_frame receive_impl(int hints) override
+    core::draw_frame receive_impl(const core::video_field field, int nb_samples) override
     {
+        // TODO - fields
         graph_->set_value("tick-time", tick_timer_.elapsed() * format_desc_.fps * 0.5);
         tick_timer_.restart();
         if (executor_.size() < 2) {
@@ -138,33 +132,39 @@ struct newtek_ndi_producer : public core::frame_producer
         }
         {
             std::lock_guard<std::mutex> lock(frames_mutex_);
-            if (frames_.size() > 0) {
+            if (!frames_.empty()) {
                 last_frame_ = frames_.front();
                 frames_.pop();
             }
             return last_frame_;
         }
     }
+
+    bool is_ready() override
+    {
+        std::lock_guard<std::mutex> lock(frames_mutex_);
+        return !frames_.empty() || last_frame_;
+    }
+
     bool prepare_next_frame()
     {
         try {
             frame_timer_.restart();
             NDIlib_video_frame_v2_t video_frame;
             NDIlib_audio_frame_v2_t audio_frame;
-            ndi_lib_->NDIlib_framesync_capture_video(
-                ndi_framesync_, &video_frame, NDIlib_frame_format_type_progressive);
-            ndi_lib_->NDIlib_framesync_capture_audio(ndi_framesync_,
-                                                     &audio_frame,
-                                                     format_desc_.audio_sample_rate,
-                                                     format_desc_.audio_channels,
-                                                     format_desc_.audio_cadence[++cadence_counter_ %= cadence_length_]);
+            ndi_lib_->framesync_capture_video(ndi_framesync_, &video_frame, NDIlib_frame_format_type_progressive);
+            ndi_lib_->framesync_capture_audio(ndi_framesync_,
+                                              &audio_frame,
+                                              format_desc_.audio_sample_rate,
+                                              format_desc_.audio_channels,
+                                              format_desc_.audio_cadence[++cadence_counter_ %= cadence_length_]);
 
             CASPAR_SCOPE_EXIT
             {
                 if (video_frame.p_data != nullptr)
-                    ndi_lib_->NDIlib_framesync_free_video(ndi_framesync_, &video_frame);
+                    ndi_lib_->framesync_free_video(ndi_framesync_, &video_frame);
                 if (audio_frame.p_data != nullptr)
-                    ndi_lib_->NDIlib_framesync_free_audio(ndi_framesync_, &audio_frame);
+                    ndi_lib_->framesync_free_audio(ndi_framesync_, &audio_frame);
             };
 
             if (video_frame.p_data != nullptr) {
@@ -198,8 +198,8 @@ struct newtek_ndi_producer : public core::frame_producer
                 audio_frame_32s.p_data = new int32_t[audio_frame.no_samples * audio_frame.no_channels];
                 if (audio_frame.p_data != nullptr) {
                     audio_frame_32s.reference_level = 0;
-                    ndi_lib_->NDIlib_util_audio_to_interleaved_32s_v2(&audio_frame, &audio_frame_32s);
-                    a_frame->channels    = audio_frame_32s.no_channels;
+                    ndi_lib_->util_audio_to_interleaved_32s_v2(&audio_frame, &audio_frame_32s);
+                    av_channel_layout_default(&a_frame->ch_layout, audio_frame_32s.no_channels);
                     a_frame->sample_rate = audio_frame_32s.sample_rate;
                     a_frame->nb_samples  = audio_frame_32s.no_samples;
                     a_frame->data[0]     = reinterpret_cast<uint8_t*>(audio_frame_32s.p_data);
@@ -247,17 +247,25 @@ struct newtek_ndi_producer : public core::frame_producer
         }
         std::string receiver_name = "CasparCG " + u8(env::version()) + " NDI Producer " + std::to_string(instance_no_);
         NDI_recv_create_desc.p_ndi_recv_name = receiver_name.c_str();
-        ndi_recv_instance_                   = ndi_lib_->NDIlib_recv_create_v3(&NDI_recv_create_desc);
-        ndi_framesync_                       = ndi_lib_->NDIlib_framesync_create(ndi_recv_instance_);
+        ndi_recv_instance_                   = ndi_lib_->recv_create_v3(&NDI_recv_create_desc);
+        ndi_framesync_                       = ndi_lib_->framesync_create(ndi_recv_instance_);
         CASPAR_VERIFY(ndi_recv_instance_);
     }
 
-    core::draw_frame last_frame() override
+    core::draw_frame last_frame(const core::video_field field) override
     {
         if (!last_frame_) {
-            last_frame_ = receive_impl(0);
+            last_frame_ = receive_impl(field, 0);
         }
         return core::draw_frame::still(last_frame_);
+    }
+
+    core::monitor::state state() const override
+    {
+        core::monitor::state state;
+        state["ndi/name"]          = u8(name_);
+        state["ndi/low_bandwidth"] = low_bandwidth_;
+        return state;
     }
 
 }; // namespace newtek
@@ -288,8 +296,7 @@ spl::shared_ptr<core::frame_producer> create_ndi_producer(const core::frame_prod
     }
     const bool low_bandwidth = contains_param(L"LOW_BANDWIDTH", params);
 
-    auto producer = spl::make_shared<newtek_ndi_producer>(
+    return spl::make_shared<newtek_ndi_producer>(
         dependencies.frame_factory, dependencies.format_desc, name_or_url, low_bandwidth);
-    return core::create_destroy_proxy(std::move(producer));
 }
 }} // namespace caspar::newtek

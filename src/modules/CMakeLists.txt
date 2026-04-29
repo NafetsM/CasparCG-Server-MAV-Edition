@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.6)
+cmake_minimum_required (VERSION 3.28)
 project("modules")
 
 add_subdirectory(replay)
@@ -8,6 +8,8 @@ add_subdirectory(oal)
 add_subdirectory(decklink)
 add_subdirectory(screen)
 add_subdirectory(newtek)
+add_subdirectory(artnet)
+
 if (ENABLE_HTML)
 	add_subdirectory(html)
 endif ()
@@ -17,3 +19,4 @@ if (MSVC)
 	add_subdirectory(bluefish)
 endif()
 
+add_subdirectory(replay)

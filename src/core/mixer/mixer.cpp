@@ -35,6 +35,7 @@
 #include <core/frame/pixel_format.h>
 #include <core/video_format.h>
 
+#include <queue>
 #include <unordered_map>
 #include <vector>
 
@@ -49,7 +50,7 @@ struct mixer::impl
     spl::shared_ptr<image_mixer>         image_mixer_;
     std::queue<std::future<const_frame>> buffer_;
 
-    impl(const impl&) = delete;
+    impl(const impl&)            = delete;
     impl& operator=(const impl&) = delete;
 
     impl(int channel_index, spl::shared_ptr<diagnostics::graph> graph, spl::shared_ptr<image_mixer> image_mixer)
@@ -61,28 +62,39 @@ struct mixer::impl
 
     const_frame operator()(std::vector<draw_frame> frames, const video_format_desc& format_desc, int nb_samples)
     {
+        image_mixer_->update_aspect_ratio(static_cast<double>(format_desc.square_width) /
+                                          static_cast<double>(format_desc.square_height));
+
         for (auto& frame : frames) {
             frame.accept(audio_mixer_);
             frame.transform().image_transform.layer_depth = 1;
             frame.accept(*image_mixer_);
         }
 
-        auto image = (*image_mixer_)(format_desc);
-        auto audio = audio_mixer_(format_desc, nb_samples);
+        auto result = image_mixer_->render(format_desc);
+        auto audio  = audio_mixer_(format_desc, nb_samples);
 
         state_["audio"] = audio_mixer_.state();
 
+        auto depth = image_mixer_->depth();
+
         buffer_.push(std::async(
             std::launch::deferred,
-            [image = std::move(image), audio = std::move(audio), graph = graph_, format_desc, tag = this]() mutable {
+            [result = std::move(result),
+             audio  = std::move(audio),
+             graph  = graph_,
+             depth,
+             format_desc,
+             tag = this]() mutable {
                 auto desc = pixel_format_desc(pixel_format::bgra);
-                desc.planes.push_back(pixel_format_desc::plane(format_desc.width, format_desc.height, 4));
+                desc.planes.push_back(pixel_format_desc::plane(format_desc.width, format_desc.height, 4, depth));
                 std::vector<array<const uint8_t>> image_data;
-                image_data.emplace_back(std::move(image.get()));
-                return const_frame(std::move(image_data), std::move(audio), desc);
+                auto                              tuple = std::move(result.get());
+                image_data.emplace_back(std::move(std::get<0>(tuple)));
+                return const_frame(tag, std::move(image_data), std::move(audio), desc, std::move(std::get<1>(tuple)));
             }));
 
-        if (buffer_.size() < 2) {
+        if (buffer_.size() <= format_desc.field_count) {
             return const_frame{};
         }
 
@@ -111,4 +123,6 @@ mutable_frame mixer::create_frame(const void* tag, const pixel_format_desc& desc
     return impl_->image_mixer_->create_frame(tag, desc);
 }
 core::monitor::state mixer::state() const { return impl_->state_; }
+
+common::bit_depth mixer::depth() const { return impl_->image_mixer_->depth(); }
 }} // namespace caspar::core

@@ -54,7 +54,7 @@ class flash_cg_proxy : public core::cg_proxy
     spl::shared_ptr<core::frame_producer> flash_producer_;
     std::wstring                          base_folder_;
 
-    flash_cg_proxy(const flash_cg_proxy&) = delete;
+    flash_cg_proxy(const flash_cg_proxy&)            = delete;
     flash_cg_proxy& operator=(const flash_cg_proxy&) = delete;
 
   public:
@@ -223,7 +223,7 @@ void copy_template_hosts()
     }
 }
 
-void init(core::module_dependencies dependencies)
+void init(const core::module_dependencies& dependencies)
 {
     if (env::properties().get(L"configuration.flash.enabled", false)) {
         CASPAR_LOG(warning) << "Flash is no longer a recommended way of creating dynamic templates. Adobe have "

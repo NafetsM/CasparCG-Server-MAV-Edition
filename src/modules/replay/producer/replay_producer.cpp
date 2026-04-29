@@ -2,24 +2,7 @@
 * Copyright (c) 2011 Sveriges Television AB <info@casparcg.com>
 * Copyright (c) 2013 Technical University of Lodz Multimedia Centre <office@cm.p.lodz.pl>
 *
-* This file is part of CasparCG (www.casparcg.com).
-*
-* CasparCG is free software: you can redistribute it and/or modify
-* it under the terms of the GNU General Public License as published by
-* the Free Software Foundation, either version 3 of the License, or
-* (at your option) any later version.
-*
-* CasparCG is distributed in the hope that it will be useful,
-* but WITHOUT ANY WARRANTY; without even the implied warranty of
-* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-* GNU General Public License for more details.
-*
-* You should have received a copy of the GNU General Public License
-* along with CasparCG. If not, see <http://www.gnu.org/licenses/>.
-*
-* Author: Robert Nagy, ronag89@gmail.com
-*          Jan Starzak, jan@ministryofgoodsteps.com
-*          Krzysztof Pyrkosz, pyrkosz@o2.pl
+* Ported to CasparCG 2.5
 */
 
 #include "replay_producer.h"
@@ -27,933 +10,807 @@
 #include "../util/frame_operations.h"
 #include "../util/file_operations.h"
 
-#include <algorithm>
-#include <sys/stat.h>
-#include <math.h>
-#include <limits>
-#include <boost/assign.hpp>
-#include <boost/filesystem.hpp>
-#include <boost/property_tree/ptree.hpp>
-#include <boost/regex.hpp>
-#include <boost/timer.hpp>
-#include <boost/algorithm/string.hpp>
-#include <tbb/concurrent_queue.h>
-
 #include <core/frame/draw_frame.h>
 #include <core/frame/pixel_format.h>
 #include <core/frame/frame_factory.h>
-#include <common/future.h>
+#include <core/frame/frame.h>
 #include <core/video_format.h>
+#include <core/monitor/monitor.h>
+
+#include <common/array.h>
+#include <common/future.h>
 #include <common/env.h>
 #include <common/array.h>
 #include <common/diagnostics/graph.h>
-#include <ffmpeg/util/av_util.h>
+#include <common/log.h>
 
-using namespace boost::assign;
+#include <boost/filesystem.hpp>
+#include <boost/regex.hpp>
+#include <boost/algorithm/string.hpp>
+#include <boost/lexical_cast.hpp>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <limits>
+#include <mutex>
+#include <queue>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
 namespace caspar { namespace replay {
 
 struct replay_producer : public core::frame_producer
 {
-    core::monitor::state                              state_;
-    mutable std::mutex                                state_mutex_;
-    const std::wstring                                filename_;
-    core::draw_frame                                  frame_;
-    core::draw_frame                                  last_frame_;
-    std::mutex frame_buffer_mutex_;
-    std::queue<std::pair<core::draw_frame, uint64_t>> frame_buffer_;
-    bool                                              frame_stable_;
-    mjpeg_file_handle                                 in_file_;
-    mjpeg_file_handle                                 in_idx_file_;
+    // ── State ─────────────────────────────────────────────────────────────────
+    core::monitor::state                               state_;
+    mutable std::mutex                                 state_mutex_;
 
-    spl::shared_ptr<mjpeg_file_header>                index_header_;
-    spl::shared_ptr<mjpeg_file_header_ex>             index_header_ex_;
-    spl::shared_ptr<core::frame_factory>              frame_factory_;
-    tbb::atomic<uint64_t>                             framenum_;
-    tbb::atomic<uint64_t>                             real_framenum_;
-    tbb::atomic<uint64_t>                             real_last_framenum_;
-    tbb::atomic<uint64_t>                             first_framenum_;
-    tbb::atomic<uint64_t>                             last_framenum_;
-    tbb::atomic<uint64_t>                             result_framenum_;
-    tbb::atomic<int>                                  runstate_;
-    uint8_t*                                          leftovers_;
-    int                                               leftovers_duration_;
-    int32_t*                                          leftovers_audio_;
-    uint32_t                                          leftovers_audio_size_;
-    bool                                              interlaced_;
-    int                                               audio_;
-    float                                             speed_;
-    float                                             abs_speed_;
-    int                                               frame_divider_;
-    int                                               frame_multiplier_;
-    bool                                              reverse_;
-    bool                                              seeked_;
-    const spl::shared_ptr<diagnostics::graph>         graph_;
-    std::thread*                                      decoder_;
+    const std::wstring                                 filename_;
+    core::draw_frame                                   frame_      { core::draw_frame::empty() };
+    core::draw_frame                                   last_frame_ { core::draw_frame::empty() };
 
+    std::mutex                                         frame_buffer_mutex_;
+    std::queue<std::pair<core::draw_frame, uint64_t>>  frame_buffer_;
+    bool                                               frame_stable_   = false;
+
+    mjpeg_file_handle                                  in_file_        = nullptr;
+    mjpeg_file_handle                                  in_idx_file_    = nullptr;
+
+    spl::shared_ptr<mjpeg_file_header>                 index_header_;
+    spl::shared_ptr<mjpeg_file_header_ex>              index_header_ex_;
+    spl::shared_ptr<core::frame_factory>               frame_factory_;
+
+    std::atomic<uint64_t>  framenum_          { 0 };
+    std::atomic<uint64_t>  real_framenum_     { 0 };
+    std::atomic<uint64_t>  real_last_framenum_{ 0 };
+    std::atomic<uint64_t>  first_framenum_    { 0 };
+    std::atomic<uint64_t>  last_framenum_     { 0 };
+    std::atomic<uint64_t>  result_framenum_   { 0 };
+    std::atomic<int>       runstate_          { 0 };
+
+    uint8_t*  leftovers_           = nullptr;
+    int       leftovers_duration_  = 0;
+    int32_t*  leftovers_audio_     = nullptr;
+    uint32_t  leftovers_audio_size_= 0;
+
+    bool     interlaced_    = false;
+    int      audio_         = 0;
+    float    speed_         = 1.0f;
+    float    abs_speed_     = 1.0f;
+    int      frame_divider_ = 1;
+    int      frame_multiplier_ = 1;
+    bool     reverse_       = false;
+    bool     seeked_        = false;
+
+    spl::shared_ptr<diagnostics::graph> graph_;
+    std::thread*                         decoder_ = nullptr;
+
+    // ── Constructor ───────────────────────────────────────────────────────────
 #pragma warning(disable:4244)
     explicit replay_producer(
-            const spl::shared_ptr<core::frame_factory>& frame_factory,
-            const std::wstring& filename,
-            const int sign,
-            const unsigned long long start_frame,
-            const unsigned long long last_frame,
-            const float start_speed,
-            const int audio = 0)
+        const spl::shared_ptr<core::frame_factory>& frame_factory,
+        const std::wstring& filename,
+        const int           sign,
+        uint64_t            start_frame,
+        uint64_t            last_frame_count,
+        float               start_speed,
+        int                 audio = -1) // -1 = auto, 0 = forced off, 1 = forced on
         : filename_(filename)
-        , frame_(core::draw_frame::empty())
-        , last_frame_(core::draw_frame::empty())
         , frame_factory_(frame_factory)
     {
-        in_file_ = safe_fopen((filename_).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE);
-        if (in_file_ != NULL)
+        in_file_ = safe_fopen(filename_.c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE);
+        if (!in_file_)
         {
-            uint64_t size = 0;
+            CASPAR_LOG(error) << print() << L" Video file not found: " << filename_;
+            CASPAR_THROW_EXCEPTION(file_not_found());
+        }
 
-            in_idx_file_ = safe_fopen((boost::filesystem::wpath(filename_).replace_extension(L".idx").wstring()).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE);
-            if (in_idx_file_ != NULL)
+        auto idx_path = boost::filesystem::path(filename_)
+                            .replace_extension(L".idx").wstring();
+        in_idx_file_ = safe_fopen(idx_path.c_str(), GENERIC_READ,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE);
+        if (!in_idx_file_)
+        {
+            CASPAR_LOG(error) << print() << L" Index file not found: " << idx_path;
+            safe_fclose(in_file_);
+            CASPAR_THROW_EXCEPTION(file_not_found());
+        }
+
+        // Wait until the index file has data (supports live recording)
+        uint64_t size = 0;
+        while (size == 0)
+        {
+            size = static_cast<uint64_t>(
+                boost::filesystem::file_size(
+                    boost::filesystem::path(filename_)
+                        .replace_extension(L".idx")));
+            if (size == 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        // Read headers
+        {
+            mjpeg_file_header* hdr = nullptr;
+            read_index_header(in_idx_file_, &hdr);
+            index_header_ = spl::shared_ptr<mjpeg_file_header>(hdr);
+
+            CASPAR_LOG(info) << print() << L" File starts at: "
+                             << boost::posix_time::to_iso_wstring(
+                                    index_header_->begin_timecode);
+
+            mjpeg_file_header_ex* hdr_ex = nullptr;
+            if (index_header_->version >= 2)
             {
-                while (size == 0)
+                read_index_header_ex(in_idx_file_, index_header_->version, &hdr_ex);
+                index_header_ex_ = spl::shared_ptr<mjpeg_file_header_ex>(hdr_ex);
+                CASPAR_LOG(info) << print() << L" Audio: "
+                                 << index_header_ex_->audio_channels << L" channels @ "
+                                 << index_header_ex_->audio_sample_rate << L" Hz";
+
+                if (index_header_->version != MJPEG_FILE_VERSION)
                 {
-                    size = (uint64_t)boost::filesystem::file_size(boost::filesystem::wpath(filename_).replace_extension(L".idx").string());
-
-                    if (size > 0) {
-                        mjpeg_file_header* header;
-                        mjpeg_file_header_ex* header_ex;
-                        read_index_header(in_idx_file_, &header);
-                        index_header_ = spl::shared_ptr<mjpeg_file_header>(header);
-                        CASPAR_LOG(info) << print() << L" File starts at: " << boost::posix_time::to_iso_wstring(index_header_->begin_timecode);
-
-                        if (index_header_->version >= 2)
-                        {
-                            read_index_header_ex(in_idx_file_, &header_ex);
-                            index_header_ex_ = spl::shared_ptr<mjpeg_file_header_ex>(header_ex);
-
-                            CASPAR_LOG(info) << print() << L" File contains " << index_header_ex_->audio_channels << L" audio channels.";
-                        }
-                        else
-                        {
-                            header_ex = new mjpeg_file_header_ex();
-                            header_ex->audio_channels = 0;
-                        }
-
-                        if (index_header_->field_mode == 3) // 3 - progressive
-                        {
-                            interlaced_ = false;
-                        }
-                        else
-                        {
-                            interlaced_ = true;
-                        }
-
-                        set_playback_speed(start_speed);
-                        audio_ = audio;
-                        result_framenum_ = 0;
-                        framenum_ = 0;
-                        last_framenum_ = 0;
-                        first_framenum_ = 0;
-                        real_framenum_ = 0;
-                        runstate_ = 0;
-
-                        leftovers_ = NULL;
-                        leftovers_duration_ = 0;
-                        leftovers_audio_ = NULL;
-                        leftovers_audio_size_ = 0;
-
-                        seeked_ = false;
-
-                        if (start_frame > 0)
-                        {
-                            if (interlaced_)
-                                seek(start_frame * 2, sign);
-                            else
-                                seek(start_frame, sign);
-                        }
-
-                        if (last_frame > 0)
-                        {
-                            last_framenum_ = start_frame + last_frame;
-                            if (interlaced_)
-                                last_framenum_ = last_framenum_ * 2;
-                        }
-
-                        graph_->set_color("frame-time", diagnostics::color(0.1f, 1.0f, 0.1f));
-                        graph_->set_color("underflow", diagnostics::color(0.6f, 0.3f, 0.9f));
-                        graph_->set_text(print());
-                        diagnostics::register_graph(graph_);
-
-                        decoder_ = new std::thread(
-                            [&]
-                            {
-                                while (runstate_ == 0)
-                                {
-                                    size_t cur_size = 0;
-                                    {
-                                        std::lock_guard<std::mutex> lock(frame_buffer_mutex_);
-                                        cur_size = frame_buffer_.size();
-                                    }
-
-                                    if (cur_size < REPLAY_PRODUCER_BUFFER_SIZE)
-                                    {
-                                        try
-                                        {
-                                            boost::timer frame_timer;
-                                            real_last_framenum_ = length_index(in_idx_file_);
-                                            // in interlaced mode make sure that number of fields is even
-                                            if (interlaced_ && !(real_last_framenum_ & 1))
-                                                real_last_framenum_--;
-                                            auto frame_pair = render_frame(0);
-                                            {
-                                                std::lock_guard<std::mutex> lock(frame_buffer_mutex_);
-                                                frame_buffer_.push(frame_pair);
-                                            }
-                                            update_diag(frame_timer.elapsed()*0.5*index_header_->fps);
-                                        }
-                                        catch (...)
-                                        {
-                                            CASPAR_LOG(error) << print() << L" Unknown exception in the decoding thread!";
-                                        }
-                                    }
-                                    else
-                                    {
-#ifdef _WIN32
-                                        Sleep(1000 / (index_header_->fps * 2));
-#else
-                                                                                usleep(1000000 / (index_header_->fps * 2));
-#endif
-                                    }
-                                }
-                            }
-                        );
-                    }
-                    else
-                    {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                    }
+                    CASPAR_LOG(warning) << print()
+                        << L" File version " << static_cast<int>(index_header_->version)
+                        << L" differs from current " << static_cast<int>(MJPEG_FILE_VERSION)
+                        << L" — index seeks may be incorrect.";
                 }
             }
             else
             {
-                CASPAR_LOG(error) << print() << L" Index file " << boost::filesystem::wpath(filename_).replace_extension(L".idx").string() << " not found";
-                throw file_not_found();
+                hdr_ex = new mjpeg_file_header_ex{};
+                hdr_ex->audio_channels    = 0;
+                hdr_ex->audio_sample_rate = 48000;
+                index_header_ex_ = spl::shared_ptr<mjpeg_file_header_ex>(hdr_ex);
             }
         }
-        else
+
+        interlaced_ = (index_header_->field_mode != 3);
+        // audio == -1 → auto-enable when file has audio channels.
+        // audio ==  0 → user explicitly disabled.
+        // audio ==  1 → user explicitly enabled.
+        audio_      = (audio < 0) ? (index_header_ex_->audio_channels > 0 ? 1 : 0)
+                                  : audio;
+
+        set_playback_speed(start_speed);
+
+        if (start_frame > 0)
+            seek(interlaced_ ? start_frame * 2 : start_frame, sign);
+
+        if (last_frame_count > 0)
         {
-            CASPAR_LOG(error) << print() << L" Video essence file " << filename_ << " not found";
-            throw file_not_found();
+            last_framenum_ = start_frame + last_frame_count;
+            if (interlaced_) last_framenum_ = last_framenum_ * 2;
         }
+
+        graph_->set_color("frame-time", diagnostics::color(0.1f, 1.0f, 0.1f));
+        graph_->set_color("underflow",  diagnostics::color(0.6f, 0.3f, 0.9f));
+        graph_->set_text(print());
+        diagnostics::register_graph(graph_);
+
+        // Decoder thread
+        decoder_ = new std::thread([this]
+        {
+            while (runstate_ == 0)
+            {
+                std::size_t cur_size = 0;
+                {
+                    std::lock_guard<std::mutex> lock(frame_buffer_mutex_);
+                    cur_size = frame_buffer_.size();
+                }
+
+                if (cur_size < REPLAY_PRODUCER_BUFFER_SIZE)
+                {
+                    try
+                    {
+                        auto t0 = std::chrono::high_resolution_clock::now();
+                        real_last_framenum_ = static_cast<uint64_t>(
+                            length_index(in_idx_file_));
+                        if (interlaced_ && !(real_last_framenum_ & 1))
+                            --real_last_framenum_;
+
+                        auto frame_pair = render_frame(0);
+                        {
+                            std::lock_guard<std::mutex> lock(frame_buffer_mutex_);
+                            frame_buffer_.push(frame_pair);
+                        }
+
+                        double elapsed = std::chrono::duration<double>(
+                            std::chrono::high_resolution_clock::now() - t0).count();
+                        update_diag(elapsed * 0.5 * index_header_->fps);
+                    }
+                    catch (...)
+                    {
+                        CASPAR_LOG(error) << print()
+                            << L" Unknown exception in decoding thread";
+                    }
+                }
+                else
+                {
+                    int sleep_ms = static_cast<int>(500.0 / index_header_->fps);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+                }
+            }
+        });
+    }
+#pragma warning(default:4244)
+
+    ~replay_producer() override
+    {
+        runstate_ = 1;
+        if (decoder_ && decoder_->joinable())
+            decoder_->join();
+        delete decoder_;
+
+        if (leftovers_)       { delete[] leftovers_;       leftovers_       = nullptr; }
+        if (leftovers_audio_) { delete[] leftovers_audio_; leftovers_audio_ = nullptr; }
+
+        safe_fclose(in_file_);
+        safe_fclose(in_idx_file_);
     }
 
-#pragma warning(default:4244)
-    core::draw_frame make_frame(uint8_t* frame_data, uint32_t size, uint32_t width, uint32_t height,
-        const int32_t* audio_data = 0, uint32_t audio_data_length = 0)
+    // ── Frame construction ────────────────────────────────────────────────────
+
+    core::draw_frame make_frame(uint8_t*       frame_data,
+                                uint32_t       /*size*/,
+                                uint32_t       width,
+                                uint32_t       height,
+                                const int32_t* audio_data        = nullptr,
+                                uint32_t       audio_data_length = 0)
     {
-        core::pixel_format_desc desc = core::pixel_format::rgb;
-        desc.planes.push_back(core::pixel_format_desc::plane(width, height, 3));
-        auto frame = frame_factory_->create_frame(this, desc);
+        // CasparCG 2.5 native format is BGRA (4 bytes per pixel)
+        core::pixel_format_desc desc(core::pixel_format::bgra);
+        desc.planes.push_back(core::pixel_format_desc::plane(width, height, 4));
+        core::mutable_frame mutable_frame = frame_factory_->create_frame(this, desc);
 
-        std::memcpy(frame.image_data(0).begin(), frame_data, width * height * 3);
-
-        if (audio_ && audio_data_length > 0) {
-            frame.audio_data() = std::vector<int32_t>(audio_data_length, 0);
-            std::memcpy(frame.audio_data().data(), audio_data, audio_data_length);
+        // Convert RGB → BGRA
+        auto* dst = mutable_frame.image_data(0).begin();
+        for (uint32_t i = 0; i < width * height; ++i)
+        {
+            dst[i * 4 + 0] = frame_data[i * 3 + 2]; // B
+            dst[i * 4 + 1] = frame_data[i * 3 + 1]; // G
+            dst[i * 4 + 2] = frame_data[i * 3 + 0]; // R
+            dst[i * 4 + 3] = 0xFF;                   // A
         }
 
-        frame_ = core::draw_frame(std::move(frame));
+        if (audio_ && audio_data_length > 0 && audio_data)
+        {
+            auto num_samples = audio_data_length / sizeof(int32_t);
+            std::vector<int32_t> audio_vec(audio_data, audio_data + num_samples);
+            mutable_frame.audio_data() = caspar::array<int32_t>(std::move(audio_vec));
+        }
 
+        frame_ = core::draw_frame(std::move(mutable_frame));
         return frame_;
     }
 
-    std::future<std::wstring> call(const std::vector<std::wstring>& param) override
+    // ── AMCP call handler ─────────────────────────────────────────────────────
+
+    std::future<std::wstring> call(const std::vector<std::wstring>& params) override
     {
-        return make_ready_future(std::move(do_call(boost::algorithm::join(param, L" "))));
+        return make_ready_future(
+            std::move(do_call(boost::algorithm::join(params, L" "))));
     }
 
     std::wstring do_call(const std::wstring& param)
     {
-        static const boost::wregex speed_exp(L"SPEED\\s+(?<VALUE>[\\d.-]+)", boost::regex::icase);
-        static const boost::wregex pause_exp(L"PAUSE", boost::regex::icase);
-        static const boost::wregex seek_exp(L"SEEK\\s+(?<SIGN>[\\+\\-\\|])?(?<VALUE>[\\d]+)", boost::regex::icase);
-        static const boost::wregex length_exp(L"LENGTH\\s+(?<VALUE>[\\d]+)", boost::regex::icase);
-        static const boost::wregex audio_exp(L"AUDIO\\s+(?<VALUE>[\\d]+)", boost::regex::icase);
+        static const boost::wregex speed_exp (L"SPEED\\s+(?<VALUE>[\\d.-]+)",          boost::regex::icase);
+        static const boost::wregex pause_exp (L"PAUSE",                                boost::regex::icase);
+        static const boost::wregex seek_exp  (L"SEEK\\s+(?<SIGN>[\\+\\-\\|])?(?<VALUE>[\\d]+)", boost::regex::icase);
+        static const boost::wregex length_exp(L"LENGTH\\s+(?<VALUE>[\\d]+)",           boost::regex::icase);
+        static const boost::wregex audio_exp (L"AUDIO\\s+(?<VALUE>[\\d]+)",            boost::regex::icase);
 
-        boost::wsmatch what;
-        // PAUSE
-        if(boost::regex_match(param, what, pause_exp))
+        boost::wsmatch m;
+
+        if (boost::regex_match(param, m, pause_exp))
         {
             set_playback_speed(0.0f);
             return L"";
         }
-        // SPEED
-        if(boost::regex_match(param, what, speed_exp))
+        if (boost::regex_match(param, m, speed_exp))
         {
-            if(!what["VALUE"].str().empty())
-            {
-                float speed = boost::lexical_cast<float>(what["VALUE"].str());
-                set_playback_speed(speed);
-            }
+            if (!m["VALUE"].str().empty())
+                set_playback_speed(boost::lexical_cast<float>(m["VALUE"].str()));
             return L"";
         }
-        // SEEK
-        if(boost::regex_match(param, what, seek_exp))
+        if (boost::regex_match(param, m, seek_exp))
         {
             int sign = 0;
-            if(!what["SIGN"].str().empty())
+            if (!m["SIGN"].str().empty())
             {
-                if (what["SIGN"].str() == L"+")
-                    sign = 1;
-                else if (what["SIGN"].str() == L"|")
-                    sign = -2;
-                else if (what["SIGN"].str() == L"-")
-                    sign = -1;
+                auto s = m["SIGN"].str();
+                if      (s == L"+") sign =  1;
+                else if (s == L"|") sign = -2;
+                else if (s == L"-") sign = -1;
             }
-            if(!what["VALUE"].str().empty())
+            if (!m["VALUE"].str().empty())
             {
-                unsigned long long position = boost::lexical_cast<unsigned long long>(what["VALUE"].str());
-                if (interlaced_)
-                    seek(position * 2, sign);
-                else
-                    seek(position, sign);
+                uint64_t pos = boost::lexical_cast<uint64_t>(m["VALUE"].str());
+                seek(interlaced_ ? pos * 2 : pos, sign);
             }
             return L"";
         }
-        // LENGTH
-        if(boost::regex_match(param, what, length_exp))
+        if (boost::regex_match(param, m, length_exp))
         {
-            if(!what["VALUE"].str().empty())
+            if (!m["VALUE"].str().empty())
             {
-                long long last_frame = boost::lexical_cast<long long>(what["VALUE"].str());
-                if (last_frame == 0)
+                long long lf = boost::lexical_cast<long long>(m["VALUE"].str());
+                if (lf == 0)
                     last_framenum_ = 0;
                 else
                 {
-                    last_framenum_ = first_framenum_ / 2 + last_frame;
-                    if (interlaced_)
-                        last_framenum_ = last_framenum_ * 2;
+                    last_framenum_ = first_framenum_ / 2 + lf;
+                    if (interlaced_) last_framenum_ = last_framenum_ * 2;
                 }
             }
             return L"";
         }
-        if(boost::regex_match(param, what, audio_exp))
+        if (boost::regex_match(param, m, audio_exp))
         {
-            if(!what["VALUE"].str().empty())
-            {
-                audio_ = (boost::lexical_cast<int>(what["VALUE"].str()) == 1 ? 1 : 0);
-            }
+            if (!m["VALUE"].str().empty())
+                audio_ = (boost::lexical_cast<int>(m["VALUE"].str()) == 1) ? 1 : 0;
             return L"";
         }
 
-        BOOST_THROW_EXCEPTION(invalid_argument());
+        CASPAR_THROW_EXCEPTION(invalid_argument());
     }
 
-    void seek(unsigned long long frame_pos, int sign)
+    // ── Playback control ──────────────────────────────────────────────────────
+
+    void seek(uint64_t frame_pos, int sign)
     {
+        uint64_t rlfn = real_last_framenum_;
         if (sign == 0)
         {
-            if (frame_pos > real_last_framenum_)
-                framenum_ = real_last_framenum_;
-            else
-                framenum_ = frame_pos;
+            framenum_ = (frame_pos > rlfn) ? rlfn : frame_pos;
         }
         else if (sign == -2)
         {
-            if (real_last_framenum_ < frame_pos - 4)
-                framenum_ = 0;
-            else
-                framenum_ = real_last_framenum_ - frame_pos - 4;
+            framenum_ = (rlfn < frame_pos + 4) ? 0 : rlfn - frame_pos - 4;
         }
         else if (sign == -1)
         {
-            if (framenum_ < frame_pos)
-                framenum_ = 0;
-            else
-                framenum_ -= frame_pos;
+            framenum_ = (framenum_ < frame_pos) ? 0 : framenum_ - frame_pos;
         }
-        else if (sign == 1)
+        else // sign == 1
         {
-            if (framenum_ + frame_pos > real_last_framenum_)
-                framenum_ = real_last_framenum_;
-            else
-                framenum_ += frame_pos;
+            uint64_t next = framenum_ + frame_pos;
+            framenum_ = (next > rlfn) ? rlfn : next;
         }
-        if (seek_index(in_idx_file_, framenum_, FILE_BEGIN))
-            CASPAR_LOG(error) << L" seek_index@seek " << framenum_;
-        first_framenum_ = framenum_;
-        seeked_ = true;
+
+        if (seek_index(in_idx_file_, static_cast<long long>(framenum_), FILE_BEGIN))
+            CASPAR_LOG(error) << L"[replay] seek_index failed at frame " << framenum_;
+
+        first_framenum_ = framenum_.load();
+        seeked_         = true;
     }
 
     void set_playback_speed(float speed)
     {
-        speed_ = speed;
-        abs_speed_ = fabs(speed);
+        speed_     = speed;
+        abs_speed_ = std::fabs(speed);
         if (speed != 0.0f)
-            frame_divider_ = abs((int)(1.0f / speed));
+            frame_divider_ = std::abs(static_cast<int>(1.0f / speed));
         else
             frame_divider_ = 0;
-        frame_multiplier_ = abs((int)(speed));
-        reverse_ = (speed >= 0.0f) ? false : true;
+        frame_multiplier_ = std::abs(static_cast<int>(speed));
+        reverse_          = (speed < 0.0f);
     }
 
     void update_diag(double elapsed)
     {
         graph_->set_text(print());
-        graph_->set_value("frame-time", elapsed*0.5);
+        graph_->set_value("frame-time", elapsed * 0.5);
 
-        state_["profiler/time"] = {elapsed, 1.0/index_header_->fps};
+        uint64_t rfn   = real_framenum_;
+        uint64_t rlfn  = real_last_framenum_;
+        uint64_t ffn   = first_framenum_;
+        uint64_t lfn   = last_framenum_;
+        double   fps   = index_header_->fps;
+        int      div   = interlaced_ ? 2 : 1;
 
-        state_["file/time"] = {((interlaced_ ? (long unsigned int)real_framenum_ / 2 : (long unsigned int)real_framenum_) / index_header_->fps), ((last_framenum_ - first_framenum_) / (interlaced_ ? 2 : 1) / index_header_->fps)};
-        state_["file/frame"] = {static_cast<int32_t>((interlaced_ ? (long unsigned int)real_framenum_ / 2 : (long unsigned int)real_framenum_)), static_cast<int32_t>(real_last_framenum_ / (interlaced_ ? 2 : 1)) };
-        state_["file/vframe"] = {static_cast<int32_t>((real_framenum_ - first_framenum_) / (interlaced_ ? 2 : 1)), static_cast<int32_t>(((last_framenum_ > 0 ? last_framenum_ : real_last_framenum_) - first_framenum_ ) / (interlaced_ ? 2 : 1))};
-        state_["file/fps"] = index_header_->fps;
-        state_["file/path"] = filename_;
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        state_["profiler/time"] = { elapsed, 1.0 / fps };
+        state_["file/time"]  = { static_cast<double>(rfn / div) / fps,
+                                  static_cast<double>((lfn - ffn) / div) / fps };
+        state_["file/frame"] = { static_cast<int32_t>(rfn / div),
+                                  static_cast<int32_t>(rlfn / div) };
+        state_["file/vframe"]= { static_cast<int32_t>((rfn - ffn) / div),
+                                  static_cast<int32_t>(((lfn > 0 ? lfn : rlfn) - ffn) / div) };
+        state_["file/fps"]   = fps;
+        state_["file/path"]  = filename_;
         state_["file/speed"] = speed_;
     }
 
+    // ── Frame rendering helpers ───────────────────────────────────────────────
+
     void move_to_next_frame()
     {
-        int frame_multiplier = frame_multiplier_ > 1 ? frame_multiplier_ : 1;
-        bool seek_needed = 0;
+        int mult = (frame_multiplier_ > 1) ? frame_multiplier_ : 1;
+        bool seek_needed = false;
+        uint64_t rlfn = real_last_framenum_;
+
         if (reverse_)
         {
-            if (framenum_ < frame_multiplier)
-                framenum_ = 0;
-            else
-                framenum_ -= frame_multiplier;
-            seek_needed = 1;
+            framenum_ = (framenum_ < static_cast<uint64_t>(mult)) ? 0 : framenum_ - mult;
+            seek_needed = true;
         }
         else
         {
-            if (framenum_ + frame_multiplier >= real_last_framenum_)
+            if (framenum_ + mult >= rlfn)
             {
-                framenum_ = real_last_framenum_;
-                seek_needed = 1;
+                framenum_   = rlfn;
+                seek_needed = true;
             }
             else
             {
-                framenum_ += frame_multiplier;
-                if (frame_multiplier > 1)
-                    seek_needed = 1;
+                framenum_ += mult;
+                if (mult > 1) seek_needed = true;
             }
         }
-        if (seek_needed && seek_index(in_idx_file_, framenum_, FILE_BEGIN))
-            CASPAR_LOG(error) << L" move_to_next_frame() seek_index(in_idx_file_, " << framenum_ << ", FILE_BEGIN)";
-    }
 
-    void sync_to_frame()
-    {
-        if (interlaced_ && framenum_ % 2 != 0)
-        {
-            //CASPAR_LOG(warning) << L" Frame number was " << framenum_ << L", syncing to First Field";
-            if (framenum_ + 1 >= real_last_framenum_)
-            {
-                seek_index(in_idx_file_, -1, FILE_CURRENT);
-                framenum_--;
-            }
-            else
-            {
-                (void)read_index(in_idx_file_);
-                framenum_++;
-            }
-        }
-    }
-
-    void proper_interlace(const mmx_uint8_t* field1, const mmx_uint8_t* field2, mmx_uint8_t* dst)
-    {
-        if (index_header_->field_mode == 1) // 1 - field mode lower
-        {
-            interlace_fields(field2, field1, dst, index_header_->width, index_header_->height, 3);
-        }
-        else
-        {
-            interlace_fields(field1, field2, dst, index_header_->width, index_header_->height, 3);
-        }
+        if (seek_needed &&
+            seek_index(in_idx_file_, static_cast<long long>(framenum_), FILE_BEGIN))
+            CASPAR_LOG(error) << L"[replay] move_to_next_frame: seek_index failed";
     }
 
 #pragma warning(disable:4244)
-    bool slow_motion_playback(uint8_t* result, int32_t** result_audio, uint32_t* result_audio_size)
+    bool slow_motion_playback(uint8_t*  result,
+                              int32_t** result_audio,
+                              uint32_t* result_audio_size)
     {
         uint32_t frame_size = index_header_->width * index_header_->height * 3;
+        auto buffer1 = std::make_unique<uint8_t[]>(frame_size);
+        auto buffer2 = std::make_unique<uint8_t[]>(frame_size);
+        black_frame(buffer1.get(), index_header_->width, index_header_->height, 3);
+        std::memcpy(buffer2.get(), buffer1.get(), frame_size);
+
+        *result_audio      = nullptr;
+        *result_audio_size = 0;
+
         int filled = 0;
-        uint8_t* buffer1 = new uint8_t[frame_size];
-        uint8_t* buffer2 = new uint8_t[frame_size];
-        black_frame(buffer1, index_header_->width, index_header_->height, 3);
-        std::copy_n(buffer1, frame_size, buffer2);
 
-        if (leftovers_ != NULL)
+        // ── Use leftover from previous call ──────────────────────────────────
+        if (leftovers_)
         {
-            // result is in buffer2
-            blend_images(leftovers_, buffer1, buffer2, index_header_->width, index_header_->height, 3, 64);
+            // blend_images: max level = 63 (= 100% src1)
+            blend_images(leftovers_, buffer1.get(), buffer2.get(),
+                         index_header_->width, index_header_->height, 3, 63);
 
-            *result_audio = new int32_t[leftovers_audio_size_ / 4];
-            *result_audio_size = leftovers_audio_size_;
-            std::copy_n(leftovers_audio_, leftovers_audio_size_ / 4, *result_audio);
+            if (leftovers_audio_ && leftovers_audio_size_ > 0)
+            {
+                *result_audio      = new int32_t[leftovers_audio_size_ / 4];
+                *result_audio_size = leftovers_audio_size_;
+                std::memcpy(*result_audio, leftovers_audio_, leftovers_audio_size_);
+            }
 
             filled += leftovers_duration_;
-            if (filled > 64)
+
+            if (filled >= 64)
             {
                 leftovers_duration_ = filled - 64;
+                std::memcpy(result, buffer2.get(), frame_size);
+                return true;
             }
             else
             {
-                delete leftovers_;
-                leftovers_ = NULL;
-                leftovers_duration_ = 0;
-                if (leftovers_audio_ != NULL)
-                    delete leftovers_audio_;
-                leftovers_audio_ = NULL;
+                delete[] leftovers_;       leftovers_       = nullptr;
+                delete[] leftovers_audio_; leftovers_audio_ = nullptr;
+                leftovers_duration_   = 0;
                 leftovers_audio_size_ = 0;
             }
         }
 
-        int frame_duration = ((1 / abs_speed_) * 64.0f);
+        int frame_duration = static_cast<int>((1.0f / abs_speed_) * 64.0f);
+        if (frame_duration <= 0) frame_duration = 1;
 
+        // ── Decode frames until output frame is filled ────────────────────────
         while (filled < 64)
         {
             long long field_pos = read_index(in_idx_file_);
-
             if (field_pos == -1)
-            {    // There are no more frames
-
-                delete buffer1;
-                delete buffer2;
-                if (*result_audio != NULL)
-                    delete *result_audio;
-                *result_audio = NULL;
+            {
+                // EOF
+                if (*result_audio) { delete[] *result_audio; *result_audio = nullptr; }
                 *result_audio_size = 0;
-
                 return false;
             }
-
             move_to_next_frame();
-
             seek_frame(in_file_, field_pos, FILE_BEGIN);
 
-            mmx_uint8_t* field = NULL;
-            uint32_t field_width;
-            uint32_t field_height;
-            uint32_t audio_size;
-            int32_t* audio = NULL;
-            (void) read_frame(in_file_, &field_width, &field_height, &field, &audio_size, &audio);
+            uint8_t* field     = nullptr;
+            uint32_t fw = 0, fh = 0, audio_sz = 0;
+            int32_t* audio_buf = nullptr;
+            read_frame(in_file_, &fw, &fh, &field, &audio_sz, &audio_buf);
 
-            // Interpolate the field to a full frame if this is a field-based mode
+            auto field_guard = std::unique_ptr<uint8_t[]>(field);
+            auto audio_guard = std::unique_ptr<int32_t[]>(audio_buf);
+
+            if (!field_guard)
+                break;
+
             if (interlaced_)
             {
-                field_double(field, buffer1, index_header_->width, index_header_->height, 3);
-                delete field;
-                field = new uint8_t[frame_size];
-                int drop_first_line = (int)(framenum_ % 2 == 0 ? index_header_->width * 3 : 0);
-                std::copy_n(buffer1, frame_size - drop_first_line, field + drop_first_line);
+                auto doubled = std::make_unique<uint8_t[]>(frame_size);
+                // Use line-doubling so both even- and odd-row extractions by
+                // the channel mixer yield the field data unchanged.
+                line_double(field_guard.get(), doubled.get(),
+                            index_header_->width, index_header_->height, 3);
+                field_guard = std::move(doubled);
             }
 
-            uint8_t level = 0;
+            // Level berechnung exakt wie im Original (max level = 63):
+            // filled==0: erster Frame → volle Gewichtung (63)
+            // sonst: wie viel vom Frame noch in den Output-Slot passt
+            uint8_t level;
             if (filled == 0)
-            {
-                level = 64;
-            }
+                level = 63;
             else
+                level = static_cast<uint8_t>((frame_duration + filled) <= 64
+                            ? frame_duration : 64 - filled);
+
+            // blend_images(src1=neuer Frame, src2=bisheriger Blend, dst=Ergebnis)
+            // Ergebnis landet in buffer2 (wie im Original)
+            blend_images(field_guard.get(), buffer2.get(), buffer2.get(),
+                         index_header_->width, index_header_->height, 3, level);
+
+            // Audio: letzter Frame gewinnt
+            if (*result_audio) delete[] *result_audio;
+            if (audio_sz > 0 && audio_guard)
             {
-                level = (uint8_t)(((frame_duration + filled) <= 64 ? frame_duration : 64 - filled));
+                *result_audio      = new int32_t[audio_sz / 4];
+                *result_audio_size = audio_sz;
+                std::memcpy(*result_audio, audio_guard.get(), audio_sz);
             }
-            blend_images(field, buffer2, buffer1, index_header_->width, index_header_->height, 3, level);
-
-            if (*result_audio != NULL)
-                delete *result_audio;
-            *result_audio = new int32_t[audio_size / 4];
-            *result_audio_size = audio_size;
-            std::copy_n(audio, audio_size / 4, *result_audio);
-
-            if (leftovers_ != NULL)
-                delete leftovers_;
-            if (leftovers_audio_ != NULL)
-                delete leftovers_audio_;
-
-            // Store the last frame as leftover
-            leftovers_ = field;
-            leftovers_audio_ = audio;
-            leftovers_audio_size_ = audio_size;
 
             filled += frame_duration;
 
-            // Switch the buffers around so that the final result is always in buffer2
-            uint8_t* temp = buffer2;
-            buffer2 = buffer1;
-            buffer1 = temp;
+            // Wenn dieser Frame über den Output-Slot hinausgeht → Leftover speichern
+            if (filled > 64)
+            {
+                leftovers_duration_   = filled - 64;
+                leftovers_audio_size_ = audio_sz;
+
+                delete[] leftovers_;
+                leftovers_ = new uint8_t[frame_size];
+                std::memcpy(leftovers_, field_guard.get(), frame_size);
+
+                delete[] leftovers_audio_;
+                if (audio_sz > 0 && audio_guard)
+                {
+                    leftovers_audio_ = new int32_t[audio_sz / 4];
+                    std::memcpy(leftovers_audio_, audio_guard.get(), audio_sz);
+                }
+                else
+                {
+                    leftovers_audio_ = nullptr;
+                }
+            }
         }
 
-        if (filled >= 64)
-        {
-            leftovers_duration_ = filled - 64;
-        }
-
-        std::copy_n(buffer2, frame_size, result);
-
-        delete buffer1;
-        delete buffer2;
-
+        std::memcpy(result, buffer2.get(), frame_size);
         return true;
     }
 #pragma warning(default:4244)
 
-    // TODO: Move the file operations and frame rendering to a separate function and put the rendered frames to a buffer
-    std::pair<core::draw_frame, uint64_t> render_frame(int hints)
+    std::pair<core::draw_frame, uint64_t> render_frame(int /*hints*/)
     {
-        int eof = 0;
-        if (!seeked_ && (
-            (speed_ == 0.0f) ||                                                  // paused
-            (reverse_ && framenum_ == 0) ||                                      // front
-            (!reverse_ && framenum_ >= real_last_framenum_) ||                   // end
-            (last_framenum_ > 0 && reverse_ && first_framenum_ >= framenum_) ||  // user defined front
-            (last_framenum_ > 0 && !reverse_ && last_framenum_ <= framenum_)))   // user defined end
-        {
-            eof = 1;
-            //frame_ = core::basic_frame::eof(); // Uncomment this to keep a steady frame after the length has run through
-            if (frame_stable_)
-            {
-                return std::make_pair(core::draw_frame::still(frame_), framenum_);
-            }
-        }
+        bool eof = !seeked_ && (
+            speed_ == 0.0f ||
+            (reverse_  && framenum_ == 0) ||
+            (!reverse_ && framenum_ >= real_last_framenum_) ||
+            (last_framenum_ > 0 &&  reverse_ && first_framenum_ >= framenum_) ||
+            (last_framenum_ > 0 && !reverse_ && last_framenum_  <= framenum_));
+
+        if (eof && frame_stable_)
+            return { core::draw_frame::still(frame_), framenum_ };
+
         seeked_ = false;
 
-        // IF trickplay is possible 0 - 1.0 || 1.0 - 2.0 || 2.0 - 3.0
-        if (((abs_speed_ > 0.0f) && (abs_speed_ < 1.0f)) || ((abs_speed_ > 1.0f) && (abs_speed_ < 2.0f)) || ((abs_speed_ > 2.0f) && (abs_speed_ < 3.0f)))
+        const uint32_t full_w  = index_header_->width;
+        const uint32_t full_h  = index_header_->height;
+        const uint32_t full_sz = full_w * full_h * 3;
+
+        const bool slow = (abs_speed_ > 0.0f && std::fmod(abs_speed_, 1.0f) != 0.0f);
+
+        // ── Slow motion ───────────────────────────────────────────────────────
+        // slow_motion_playback returns one rendered field worth of data
+        // (already field-doubled to full size for interlaced files).
+        if (slow)
         {
-            uint32_t frame_size = index_header_->width * index_header_->height * 3;
-            uint8_t* field1 = new uint8_t[frame_size];
-            uint8_t* field2 = NULL;
-            int32_t* audio1 = NULL;
-            uint32_t audio1_size = 0;
-            int32_t* audio2 = NULL;
-            uint32_t audio2_size = 0;
-            uint8_t* full_frame = NULL;
+            auto rendered = std::make_unique<uint8_t[]>(full_sz);
+            int32_t* audio = nullptr; uint32_t audio_sz = 0;
 
-            if (interlaced_)
-            {
-                field2 = new uint8_t[frame_size];
-                full_frame = new uint8_t[frame_size];
-            }
+            if (!slow_motion_playback(rendered.get(), &audio, &audio_sz))
+                return { frame_, framenum_ };
 
-            if (!slow_motion_playback(field1, &audio1, &audio1_size))
-            {
-                return std::make_pair(frame_, framenum_);
-            }
-            else
-            {
-                if (!interlaced_)
-                {
-                    make_frame(field1, frame_size, index_header_->width, index_header_->height, audio1, audio1_size);
-                    frame_stable_ = true;
-                    delete field1;
-                    if (audio1 != NULL)
-                        delete audio1;
-
-                    return std::make_pair(frame_, framenum_);
-                }
-
-                if (!slow_motion_playback(field2, &audio2, &audio2_size))
-                {
-                    make_frame(field1, frame_size, index_header_->width, index_header_->height, audio1, audio1_size);
-                    frame_stable_ = true;
-                    delete field1;
-                    delete field2;
-                    delete full_frame;
-                    if (audio1 != NULL)
-                        delete audio1;
-                    if (audio2 != NULL)
-                        delete audio2;
-
-                    return std::make_pair(frame_, framenum_);
-                }
-                else
-                {
-                    int32_t* audio = new int32_t[(audio1_size + audio2_size) / 4];
-                    std::copy_n(audio1, audio1_size / 4, audio);
-                    std::copy_n(audio2, audio2_size / 4, audio + (audio1_size / 4));
-
-                    interlace_frames(field1, field2, full_frame, index_header_->width, index_header_->height, 3);
-                    make_frame(full_frame, frame_size, index_header_->width, index_header_->height, audio, audio1_size + audio2_size);
-                    frame_stable_ = false;
-                    delete field1;
-                    delete field2;
-                    delete full_frame;
-                    delete audio;
-                    if (audio1 != NULL)
-                        delete audio1;
-                    if (audio2 != NULL)
-                        delete audio2;
-
-                    return std::make_pair(frame_, framenum_);
-                }
-            }
+            auto audio_guard = std::unique_ptr<int32_t[]>(audio);
+            make_frame(rendered.get(), full_sz, full_w, full_h, audio, audio_sz);
+            frame_stable_ = false;
+            return { frame_, framenum_ };
         }
 
-        if (leftovers_ != NULL)
+        // ── Normal / fast playback ────────────────────────────────────────────
+        // One .mav entry per call — for interlaced files the entry is one field
+        // (half height); the channel mixer for a 1080i50 output extracts
+        // alternate rows so a line-doubled field placed in a full-height frame
+        // is correctly seen as the right field, regardless of which row set the
+        // mixer pulls.
+
+        if (leftovers_)
         {
-            delete leftovers_;
-            leftovers_ = NULL;
-            if (leftovers_audio_ != NULL)
-                delete leftovers_audio_;
-            leftovers_audio_ = NULL;
+            delete[] leftovers_;       leftovers_       = nullptr;
+            delete[] leftovers_audio_; leftovers_audio_ = nullptr;
             leftovers_audio_size_ = 0;
         }
 
-        // ELSE
-        if (abs_speed_ >= 1.0f)
-            sync_to_frame();
+        long long field_pos = read_index(in_idx_file_);
+        if (field_pos == -1)
+            return { frame_, framenum_ };
 
-        long long field1_pos = read_index(in_idx_file_);
+        move_to_next_frame();
+        seek_frame(in_file_, field_pos, FILE_BEGIN);
 
-        if (field1_pos == -1)
-        {    // There are no more frames
-            return std::make_pair(frame_, framenum_);
-        }
+        uint8_t* field = nullptr;
+        uint32_t fw = 0, fh = 0, audio_sz = 0;
+        int32_t* audio = nullptr;
+        uint32_t field_size = read_frame(in_file_, &fw, &fh, &field, &audio_sz, &audio);
 
-        move_to_next_frame(); // CHECK THIS
+        auto field_guard = std::unique_ptr<uint8_t[]>(field);
+        auto audio_guard = std::unique_ptr<int32_t[]>(audio);
 
-        seek_frame(in_file_, field1_pos, FILE_BEGIN);
-
-        mmx_uint8_t* field1 = NULL;
-        mmx_uint8_t* field2 = NULL;
-        mmx_uint8_t* full_frame = NULL;
-        int32_t* audio1 = NULL;
-        int32_t* audio2 = NULL;
-        int32_t* audio = NULL;
-        uint32_t field1_width;
-        uint32_t field1_height;
-        uint32_t audio1_size;
-        uint32_t audio2_size;
-        uint32_t field1_size = read_frame(in_file_, &field1_width, &field1_height, &field1, &audio1_size, &audio1);
-        if (field1 == nullptr)
-        {
-            delete audio1;
-            return std::make_pair(frame_, framenum_);
-        }
+        if (!field)
+            return { frame_, framenum_ };
 
         if (!interlaced_)
         {
-            make_frame(field1, field1_size, index_header_->width, index_header_->height, audio1, audio1_size);
-            frame_stable_ = true;
-
-            delete field1;
-            delete audio1;
-
-            return std::make_pair(frame_, framenum_);
+            // Progressive file: JPEG entry already covers the full frame.
+            make_frame(field, field_size, fw, fh, audio, audio_sz);
+            frame_stable_ = (speed_ == 0.0f || eof);
+            return { frame_, framenum_ };
         }
 
-        if ((speed_ == 0.0f || eof) && interlaced_)
-        {
-            mmx_uint8_t* full_frame1 = new mmx_uint8_t[field1_size * 2];
-
-            field_double(field1, full_frame1, index_header_->width, index_header_->height, 3);
-            make_frame(full_frame1, field1_size * 2, index_header_->width, index_header_->height);
-            frame_stable_ = true;
-
-            delete field1;
-            delete audio1;
-            delete full_frame1;
-
-            return std::make_pair(frame_, framenum_);
-        }
-
-        long long field2_pos = read_index(in_idx_file_);
-
-        move_to_next_frame();
-
-        seek_frame(in_file_, field2_pos, FILE_BEGIN);
-
-        uint32_t field2_size = read_frame(in_file_, &field1_width, &field1_height, &field2, &audio2_size, &audio2);
-        if (field2 == nullptr)
-        {
-            delete field1;
-            delete audio1;
-            delete audio2;
-            return std::make_pair(frame_, framenum_);
-        }
-
-        audio = new int32_t[(audio1_size + audio2_size)/4];
-        memcpy(audio, audio1, audio1_size);
-        memcpy(audio + audio1_size/4, audio2, audio2_size);
-        delete audio1;
-        delete audio2;
-
-        full_frame = new mmx_uint8_t[field1_size + field2_size];
-
-        proper_interlace(field1, field2, full_frame);
-
-        make_frame(full_frame, field1_size + field2_size, index_header_->width, index_header_->height, audio, audio1_size + audio2_size);
-        frame_stable_ = false;
-
-        if (field1 != NULL)
-            delete field1;
-        if (field2 != NULL)
-            delete field2;
-        delete audio;
-        delete full_frame;
-
-        return std::make_pair(frame_, framenum_);
+        // Interlaced file: line-double the half-height field into a full frame.
+        auto full = std::make_unique<uint8_t[]>(full_sz);
+        line_double(field, full.get(), full_w, full_h, 3);
+        make_frame(full.get(), full_sz, full_w, full_h, audio, audio_sz);
+        frame_stable_ = (speed_ == 0.0f || eof);
+        return { frame_, framenum_ };
     }
 
-    core::draw_frame receive_impl(int nb_samples) override
+    // ── frame_producer interface ──────────────────────────────────────────────
+
+    core::draw_frame receive_impl(const core::video_field /*field*/,
+                                  int                    /*nb_samples*/) override
     {
         std::lock_guard<std::mutex> lock(frame_buffer_mutex_);
-
-        if (frame_buffer_.size() < 1)
+        if (frame_buffer_.empty())
         {
-            result_framenum_++;
-
-            graph_->set_tag(caspar::diagnostics::tag_severity::WARNING, "underflow");
-            return last_frame_;    // repeat last frame
+            ++result_framenum_;
+            graph_->set_tag(diagnostics::tag_severity::WARNING, "underflow");
+            return last_frame_;
         }
 
-        auto frame = last_frame_= frame_buffer_.front().first;
-        real_framenum_ = frame_buffer_.front().second;
+        auto [frm, fn] = frame_buffer_.front();
         frame_buffer_.pop();
-
-        result_framenum_++;
-
-        return frame;
+        last_frame_   = frm;
+        real_framenum_ = fn;
+        ++result_framenum_;
+        return frm;
     }
 
-    core::draw_frame last_frame() override
+    core::draw_frame last_frame(const core::video_field /*field*/) override
     {
         return core::draw_frame::still(last_frame_);
     }
 
-#pragma warning (disable: 4244)
-    virtual uint32_t nb_frames() const override
+#pragma warning(disable:4244)
+    uint32_t nb_frames() const override
     {
-        if (last_framenum_ > 0)
+        if (last_framenum_ > 0 && speed_ != 0.0f)
         {
-            return (uint32_t)((interlaced_ ? ((last_framenum_ - first_framenum_) / 2) : (last_framenum_ - first_framenum_)) / speed_);
+            // framenum_ counts .mav entries; receive_impl pops one per call.
+            // For interlaced files this means one entry per channel field tick.
+            uint64_t span = last_framenum_ - first_framenum_;
+            return static_cast<uint32_t>(span / speed_);
         }
         return std::numeric_limits<uint32_t>::max();
     }
-#pragma warning (default: 4244)
+#pragma warning(default:4244)
 
-    virtual std::wstring print() const override
+    bool is_ready() override { return true; }
+
+    std::wstring print() const override
     {
-        return L"replay_producer[" + filename_ + L"|" + boost::lexical_cast<std::wstring>(interlaced_ ? (long unsigned int)real_framenum_ / 2 : (long unsigned int)real_framenum_)
-             + L"|" + boost::lexical_cast<std::wstring>(speed_)
-             + L"]";
+        uint64_t fn = interlaced_ ? real_framenum_ / 2 : real_framenum_.load();
+        return L"replay_producer[" + filename_ +
+               L"|" + std::to_wstring(fn) +
+               L"|" + std::to_wstring(speed_) + L"]";
     }
 
-    core::monitor::state state() const
+    std::wstring name() const override { return L"replay"; }
+
+    core::monitor::state state() const override
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         return state_;
     }
-
-    ~replay_producer()
-    {
-        runstate_ = 1;
-        if (decoder_ != NULL)
-        {
-            if (decoder_->joinable())
-            {
-                decoder_->join();
-            }
-        }
-
-        if (in_file_ != NULL)
-            safe_fclose(in_file_);
-
-        if (in_idx_file_ != NULL)
-            safe_fclose(in_idx_file_);
-    }
-
-    std::wstring name() const override
-    {
-        return L"replay";
-    }
 };
 
-core::draw_frame create_thumbnail(const core::frame_producer_dependencies& dependencies, const std::wstring& media_file)
+// ── Factories ─────────────────────────────────────────────────────────────────
+
+core::draw_frame create_thumbnail(
+    const core::frame_producer_dependencies& /*deps*/,
+    const std::wstring&                      /*media_file*/)
 {
     return core::draw_frame::empty();
 }
 
-spl::shared_ptr<core::frame_producer> create_producer(const core::frame_producer_dependencies& dependencies, const std::vector<std::wstring>& params)
+spl::shared_ptr<core::frame_producer> create_producer(
+    const core::frame_producer_dependencies& deps,
+    const std::vector<std::wstring>&         params)
 {
-    static const std::vector<std::wstring> extensions = list_of(L"mav");
-        std::wstring filename = env::media_folder() + params.at(0);
+    static const std::vector<std::wstring> extensions = { L"mav" };
 
-    auto ext = std::find_if(extensions.begin(), extensions.end(), [&](const std::wstring& ex) -> bool
+    std::wstring filename = env::media_folder() + params.at(0);
+
+    auto ext_it = std::find_if(
+        extensions.begin(), extensions.end(),
+        [&](const std::wstring& ex)
         {
-            return boost::filesystem::is_regular_file(boost::filesystem::wpath(filename).replace_extension(ex));
+            return boost::filesystem::is_regular_file(
+                boost::filesystem::path(filename).replace_extension(ex));
         });
 
-    if(ext == extensions.end())
+    if (ext_it == extensions.end())
         return core::frame_producer::empty();
 
-    int sign = 0;
-    int audio = 0;
-    unsigned long long start_frame = 0;
-    unsigned long long last_frame = 0;
-    float start_speed = 1.0f;
-    if (params.size() >= 3)
-    {
-        for (uint16_t i=0; i<params.size(); i++)
-        {
-            if (boost::iequals(params[i], L"SEEK"))
-            {
-                static const boost::wregex seek_exp(L"(?<SIGN>[\\|])?(?<VALUE>[\\d]+)", boost::regex::icase);
-                boost::wsmatch what;
-                if(boost::regex_match(params[i+1], what, seek_exp))
-                {
+    int      sign        = 0;
+    int      audio       = -1; // -1 = auto (enable when file has audio)
+    uint64_t start_frame = 0;
+    uint64_t last_frame  = 0;
+    float    start_speed = 1.0f;
 
-                    if(!what["SIGN"].str().empty())
-                    {
-                        if (what["SIGN"].str() == L"|")
-                            sign = -2;
-                        else
-                            sign = 0;
-                    }
-                    if(!what["VALUE"].str().empty())
-                    {
-                        start_frame = boost::lexical_cast<unsigned long long>(what["VALUE"].str());
-                    }
-                }
-            }
-            else if (boost::iequals(params[i], L"SPEED"))
+    for (std::size_t i = 0; i < params.size(); ++i)
+    {
+        if (boost::iequals(params[i], L"SEEK") && i + 1 < params.size())
+        {
+            static const boost::wregex seek_exp(L"(?<SIGN>[\\|])?(?<VALUE>[\\d]+)",
+                                                boost::regex::icase);
+            boost::wsmatch m;
+            if (boost::regex_match(params[i + 1], m, seek_exp))
             {
-                static const boost::wregex speed_exp(L"(?<VALUE>[\\d.-]+)", boost::regex::icase);
-                boost::wsmatch what;
-                if (boost::regex_match(params[i+1], what, speed_exp))
-                {
-                    if (!what["VALUE"].str().empty())
-                    {
-                        start_speed = boost::lexical_cast<float>(what["VALUE"].str());
-                    }
-                }
+                if (!m["SIGN"].str().empty()) sign = -2;
+                if (!m["VALUE"].str().empty())
+                    start_frame = boost::lexical_cast<uint64_t>(m["VALUE"].str());
             }
-            else if (boost::iequals(params[i], L"LENGTH"))
-            {
-                static const boost::wregex length_exp(L"(?<VALUE>[\\d]+)", boost::regex::icase);
-                boost::wsmatch what;
-                if (boost::regex_match(params[i+1], what, length_exp))
-                {
-                    if (!what["VALUE"].str().empty())
-                    {
-                        last_frame = boost::lexical_cast<unsigned long long>(what["VALUE"].str());
-                    }
-                }
-            }
-            else if (boost::iequals(params[i], L"AUDIO"))
-            {
-                static const boost::wregex audio_exp(L"(?<VALUE>[\\d]+)", boost::regex::icase);
-                boost::wsmatch what;
-                if (boost::regex_match(params[i+1], what, audio_exp))
-                {
-                    if (!what["VALUE"].str().empty())
-                    {
-                        audio = (boost::lexical_cast<int>(what["VALUE"].str()) == 1 ? 1 : 0);
-                    }
-                }
-            }
+        }
+        else if (boost::iequals(params[i], L"SPEED") && i + 1 < params.size())
+        {
+            start_speed = boost::lexical_cast<float>(params[i + 1]);
+        }
+        else if (boost::iequals(params[i], L"LENGTH") && i + 1 < params.size())
+        {
+            last_frame = boost::lexical_cast<uint64_t>(params[i + 1]);
+        }
+        else if (boost::iequals(params[i], L"AUDIO") && i + 1 < params.size())
+        {
+            audio = (boost::lexical_cast<int>(params[i + 1]) == 1) ? 1 : 0;
         }
     }
 
-    return spl::make_shared<replay_producer>(dependencies.frame_factory, filename + L"." + *ext, sign, start_frame, last_frame, start_speed, audio);
+    return spl::make_shared<replay_producer>(
+        deps.frame_factory,
+        filename + L"." + *ext_it,
+        sign,
+        start_frame,
+        last_frame,
+        start_speed,
+        audio);
 }
 
-}}
+}} // namespace caspar::replay

@@ -1,31 +1,35 @@
 #pragma once
 
-// NOTE : The following MIT license applies to this file ONLY and not to the SDK as a whole. Please review the SDK documentation 
-// for the description of the full license terms, which are also provided in the file "NDI License Agreement.pdf" within the SDK or 
-// online at http://new.tk/ndisdk_license/. Your use of any part of this SDK is acknowledgment that you agree to the SDK license 
-// terms. The full NDI SDK may be downloaded at http://ndi.tv/
+// NOTE : The following MIT license applies to this file ONLY and not to the SDK as a whole. Please review
+// the SDK documentation for the description of the full license terms, which are also provided in the file
+// "NDI License Agreement.pdf" within the SDK or online at http://ndi.link/ndisdk_license. Your use of any
+// part of this SDK is acknowledgment that you agree to the SDK license terms. The full NDI SDK may be
+// downloaded at http://ndi.video/
 //
-//*************************************************************************************************************************************
-// 
-// Copyright(c) 2014-2020, NewTek, inc.
-// 
-// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation 
-// files(the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, 
-// merge, publish, distribute, sublicense, and / or sell copies of the Software, and to permit persons to whom the Software is 
-// furnished to do so, subject to the following conditions :
+//***********************************************************************************************************
 //
-// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-// 
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF 
-// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE 
-// FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION 
-// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+// Copyright (C) 2023-2026 Vizrt NDI AB. All rights reserved.
 //
-//*************************************************************************************************************************************
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+// associated documentation files(the "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+// copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+// following conditions :
+//
+// The above copyright notice and this permission notice shall be included in all copies or substantial
+// portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+// LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+// EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+// THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+//***********************************************************************************************************
 
 
-// C++ implementations of default constructors are here to avoid them needing to be inline with
-// all of the rest of the code.
+// C++ implementations of default constructors are here to avoid them needing to be inline with all of the
+// rest of the code.
 
 #ifdef __clang__
 #pragma clang diagnostic push
@@ -43,7 +47,7 @@ inline NDIlib_video_frame_v2_t::NDIlib_video_frame_v2_t(int xres_, int yres_, ND
 	  picture_aspect_ratio(picture_aspect_ratio_), frame_format_type(frame_format_type_),
 	  timecode(timecode_), p_data(p_data_), line_stride_in_bytes(line_stride_in_bytes_), p_metadata(p_metadata_), timestamp(timestamp_) {}
 
-inline NDIlib_audio_frame_v2_t::NDIlib_audio_frame_v2_t(int sample_rate_, int no_channels_, int no_samples_, int64_t timecode_, float* p_data_, 
+inline NDIlib_audio_frame_v2_t::NDIlib_audio_frame_v2_t(int sample_rate_, int no_channels_, int no_samples_, int64_t timecode_, float* p_data_,
                                                         int channel_stride_in_bytes_, const char* p_metadata_, int64_t timestamp_)
 	: sample_rate(sample_rate_), no_channels(no_channels_), no_samples(no_samples_), timecode(timecode_),
 	  p_data(p_data_), channel_stride_in_bytes(channel_stride_in_bytes_), p_metadata(p_metadata_), timestamp(timestamp_) {}
@@ -62,7 +66,7 @@ inline NDIlib_video_frame_t::NDIlib_video_frame_t(int xres_, int yres_, NDIlib_F
 	  picture_aspect_ratio(picture_aspect_ratio_), frame_format_type(frame_format_type_),
 	  timecode(timecode_), p_data(p_data_), line_stride_in_bytes(line_stride_in_bytes_) {}
 
-inline NDIlib_audio_frame_t::NDIlib_audio_frame_t(int sample_rate_, int no_channels_, int no_samples_, int64_t timecode_, float* p_data_, 
+inline NDIlib_audio_frame_t::NDIlib_audio_frame_t(int sample_rate_, int no_channels_, int no_samples_, int64_t timecode_, float* p_data_,
                                                   int channel_stride_in_bytes_)
 	: sample_rate(sample_rate_), no_channels(no_channels_), no_samples(no_samples_), timecode(timecode_),
 	  p_data(p_data_), channel_stride_in_bytes(channel_stride_in_bytes_) {}
@@ -72,6 +76,9 @@ inline NDIlib_metadata_frame_t::NDIlib_metadata_frame_t(int length_, int64_t tim
 
 inline NDIlib_tally_t::NDIlib_tally_t(bool on_program_, bool on_preview_)
 	: on_program(on_program_), on_preview(on_preview_) {}
+
+inline NDIlib_listener_event::NDIlib_listener_event(void)
+	: p_uuid(NULL), p_name(NULL), p_value(NULL) {}
 
 inline NDIlib_routing_create_t::NDIlib_routing_create_t(const char* p_ndi_name_, const char* p_groups_)
 	: p_ndi_name(p_ndi_name_), p_groups(p_groups_) {}
@@ -109,6 +116,25 @@ inline NDIlib_audio_frame_interleaved_32s_t::NDIlib_audio_frame_interleaved_32s_
 
 inline NDIlib_audio_frame_interleaved_32f_t::NDIlib_audio_frame_interleaved_32f_t(int sample_rate_, int no_channels_, int no_samples_, int64_t timecode_, float* p_data_)
 	: sample_rate(sample_rate_), no_channels(no_channels_), no_samples(no_samples_), timecode(timecode_), p_data(p_data_) {}
+
+inline NDIlib_recv_advertiser_create_t::NDIlib_recv_advertiser_create_t(const char* p_url_address)
+	: p_url_address(p_url_address) {}
+
+inline NDIlib_recv_listener_create_t::NDIlib_recv_listener_create_t(const char* p_url_address)
+	: p_url_address(p_url_address) {}
+
+inline NDIlib_receiver_t::NDIlib_receiver_t(void)
+	: p_uuid(NULL), p_name(NULL), p_input_uuid(NULL), p_input_name(NULL), p_address(NULL),
+	  p_streams(NULL), num_streams(0), p_commands(NULL), num_commands(0), events_subscribed(false) {}
+
+inline NDIlib_send_advertiser_create_t::NDIlib_send_advertiser_create_t(const char* p_url_address)
+	: p_url_address(p_url_address) {}
+
+inline NDIlib_send_listener_create_t::NDIlib_send_listener_create_t(const char* p_url_address)
+	: p_url_address(p_url_address) {}
+
+inline NDIlib_sender_t::NDIlib_sender_t(void)
+	: p_uuid(NULL), p_name(NULL), p_metadata(NULL), p_address(NULL), port(0), p_groups(NULL), num_groups(0), events_subscribed(false) {}
 
 #ifdef __clang__
 #pragma clang diagnostic pop

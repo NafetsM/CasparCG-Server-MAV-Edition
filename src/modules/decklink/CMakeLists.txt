@@ -1,34 +1,41 @@
-cmake_minimum_required (VERSION 2.6)
+cmake_minimum_required (VERSION 3.28)
 project (decklink)
 
 set(SOURCES
 		consumer/decklink_consumer.cpp
+		consumer/decklink_consumer.h
+		consumer/v210_strategies.cpp
+		consumer/sdr_bgra_strategy.cpp
+		consumer/format_strategy.h
+		consumer/config.cpp
+		consumer/config.h
+		consumer/monitor.cpp
+		consumer/monitor.h
+		consumer/vanc.cpp
+		consumer/vanc.h
+		consumer/vanc_scte104_strategy.cpp
+		consumer/vanc_op47_strategy.cpp
 
 		producer/decklink_producer.cpp
-
-		decklink.cpp
-		StdAfx.cpp
-)
-set(HEADERS
-		consumer/decklink_consumer.h
-
 		producer/decklink_producer.h
 
 		util/util.h
 
+		decklink.cpp
 		decklink.h
+
 		decklink_api.h
 		StdAfx.h
 )
+
 if (MSVC)
-	set(OS_SPECIFIC_SOURCES
-			StdAfx.c
+	list(APPEND SOURCES
 			interop/DeckLinkAPI_i.c
 			interop/DeckLinkAPI.h
 			interop/DeckLinkAPIVersion.h
 	)
 else()
-	set(OS_SPECIFIC_SOURCES
+	list(APPEND SOURCES
 			linux_interop/DeckLinkAPIConfiguration.h
 			linux_interop/DeckLinkAPIDeckControl.h
 			linux_interop/DeckLinkAPIDispatch.cpp
@@ -51,15 +58,15 @@ else()
 	)
 endif ()
 
-add_library(decklink ${SOURCES} ${HEADERS} ${OS_SPECIFIC_SOURCES})
-add_precompiled_header(decklink StdAfx.h FORCEINCLUDE)
-configure_file("${PROJECT_SOURCE_DIR}/packages.config" "${CMAKE_CURRENT_BINARY_DIR}/packages.config")
-
-include_directories(..)
-include_directories(../..)
-include_directories(${BOOST_INCLUDE_PATH})
-include_directories(${TBB_INCLUDE_PATH})
-include_directories(${FFMPEG_INCLUDE_PATH})
+casparcg_add_module_project(decklink
+	SOURCES ${SOURCES}
+	INIT_FUNCTION "decklink::init"
+)
+target_include_directories(decklink PRIVATE
+    ..
+    ${FFMPEG_INCLUDE_PATH}
+    )
+target_precompile_headers(decklink PRIVATE "StdAfx.h")
 
 set_target_properties(decklink PROPERTIES FOLDER modules)
 source_group(sources ./*)
@@ -69,21 +76,14 @@ source_group(sources\\producer producer/*)
 source_group(sources\\util util/*)
 
 if (MSVC)
-	target_link_libraries(decklink
-			common
-			core
+	target_link_libraries(decklink PRIVATE
 			ffmpeg
 	)
 else()
-	target_link_libraries(decklink
-			common
-			core
+	target_link_libraries(decklink PRIVATE
 			ffmpeg
 
 			dl
 	)
 endif ()
 
-casparcg_add_include_statement("modules/decklink/decklink.h")
-casparcg_add_init_statement("decklink::init" "decklink")
-casparcg_add_module_project("decklink")

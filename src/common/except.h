@@ -29,8 +29,12 @@
 
 #include <boost/exception/all.hpp>
 #include <boost/throw_exception.hpp>
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <boost/stacktrace.hpp>
 
 namespace caspar {
@@ -145,8 +149,7 @@ struct not_supported : virtual user_error
 
 #define CASPAR_THROW_EXCEPTION(x)                                                                                      \
     ::boost::throw_exception(::boost::enable_error_info(x)                                                             \
-                             << ::boost::throw_function(BOOST_THROW_EXCEPTION_CURRENT_FUNCTION)                        \
-                             << ::boost::throw_file(__FILE__) << ::boost::throw_line((int)__LINE__)                    \
-                             << stacktrace_info())
+                             << ::boost::throw_function(BOOST_CURRENT_FUNCTION) << ::boost::throw_file(__FILE__)       \
+                             << ::boost::throw_line((int)__LINE__) << stacktrace_info())
 
 } // namespace caspar

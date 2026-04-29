@@ -1,8 +1,9 @@
-cmake_minimum_required (VERSION 2.6)
+cmake_minimum_required (VERSION 3.28)
 project (core)
 
 set(SOURCES
 		consumer/frame_consumer.cpp
+		consumer/frame_consumer_registry.cpp
 		consumer/output.cpp
 
 		diagnostics/call_context.cpp
@@ -25,15 +26,16 @@ set(SOURCES
 
 		producer/cg_proxy.cpp
 		producer/frame_producer.cpp
+		producer/frame_producer_registry.cpp
 		producer/layer.cpp
 		producer/stage.cpp
 
-		StdAfx.cpp
 		video_channel.cpp
 		video_format.cpp
 )
 set(HEADERS
 		consumer/frame_consumer.h
+		consumer/frame_consumer_registry.h
 		consumer/output.h
 
 		diagnostics/call_context.h
@@ -64,6 +66,7 @@ set(HEADERS
 
 		producer/cg_proxy.h
 		producer/frame_producer.h
+		producer/frame_producer_registry.h
 		producer/layer.h
 		producer/stage.h
 
@@ -72,17 +75,13 @@ set(HEADERS
 		StdAfx.h
 		video_channel.h
 		video_format.h
+		consumer/channel_info.h
 )
 
-add_library(core ${SOURCES} ${HEADERS})
-add_precompiled_header(core StdAfx.h FORCEINCLUDE)
-configure_file("${PROJECT_SOURCE_DIR}/packages.config" "${CMAKE_CURRENT_BINARY_DIR}/packages.config")
-
-include_directories(..)
-include_directories(${BOOST_INCLUDE_PATH})
-include_directories(${TBB_INCLUDE_PATH})
-include_directories(${SFML_INCLUDE_PATH})
-include_directories(${GLEW_INCLUDE_PATH})
+casparcg_add_library(core SOURCES ${SOURCES} ${HEADERS})
+target_include_directories(core PRIVATE ..)
+target_precompile_headers(core PRIVATE StdAfx.h)
+target_link_libraries(core PRIVATE common GLEW::glew sfml-graphics)
 
 source_group(sources ./*)
 source_group(sources\\consumer consumer/*)
@@ -97,13 +96,3 @@ source_group(sources\\producer\\color producer/color/*)
 source_group(sources\\producer\\route producer/route/*)
 source_group(sources\\producer\\transition producer/transition/*)
 source_group(sources\\producer\\separated producer/separated/*)
-
-if (MSVC)
-	target_link_libraries(core
-			common
-	)
-else()
-	target_link_libraries(core
-			common
-	)
-endif()

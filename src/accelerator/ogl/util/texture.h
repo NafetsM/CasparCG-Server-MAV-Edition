@@ -21,20 +21,22 @@
 
 #pragma once
 
+#include <common/bit_depth.h>
+#include <core/frame/frame.h>
 #include <memory>
 
 namespace caspar { namespace accelerator { namespace ogl {
 
-class texture final
+class texture final : public core::texture
 {
   public:
-    texture(int width, int height, int stride);
+    texture(int width, int height, int stride, common::bit_depth depth = common::bit_depth::bit8);
     texture(const texture&) = delete;
     texture(texture&& other);
     ~texture();
 
     texture& operator=(const texture&) = delete;
-    texture& operator                  =(texture&& other);
+    texture& operator=(texture&& other);
 
 #ifdef WIN32
     void copy_from(int source);
@@ -44,14 +46,17 @@ class texture final
 
     void attach();
     void clear();
-    void bind(int index);
-    void unbind();
 
-    int width() const;
-    int height() const;
-    int stride() const;
-    int size() const;
-    int id() const;
+    virtual void bind(int index) override;
+    virtual void unbind() override;
+
+    int               width() const;
+    int               height() const;
+    int               stride() const;
+    common::bit_depth depth() const;
+    void              set_depth(common::bit_depth depth);
+    int               size() const;
+    int               id() const;
 
   private:
     struct impl;

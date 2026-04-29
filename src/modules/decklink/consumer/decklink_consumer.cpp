@@ -17,79 +17,47 @@
  * along with CasparCG. If not, see <http://www.gnu.org/licenses/>.
  *
  * Author: Robert Nagy, ronag89@gmail.com
+ * Author: Julian Waller, julian@superfly.tv
  */
 
 #include "../StdAfx.h"
 
+#include "common/os/thread.h"
+#include "config.h"
 #include "decklink_consumer.h"
+#include "format_strategy.h"
+#include "monitor.h"
+#include "vanc.h"
 
-#include "../decklink.h"
 #include "../util/util.h"
 
-#include "../decklink_api.h"
-
+#include <core/consumer/channel_info.h>
 #include <core/consumer/frame_consumer.h>
-#include <core/diagnostics/call_context.h>
 #include <core/frame/frame.h>
-#include <core/mixer/audio/audio_mixer.h>
+#include <core/frame/pixel_format.h>
+#include <core/video_format.h>
 
-#include <common/array.h>
 #include <common/diagnostics/graph.h>
 #include <common/except.h>
 #include <common/executor.h>
-#include <common/future.h>
-#include <common/memshfl.h>
-#include <common/param.h>
 #include <common/timer.h>
 
-#include <tbb/scalable_allocator.h>
+#include <tbb/parallel_for.h>
 
 #include <boost/circular_buffer.hpp>
-#include <boost/lexical_cast.hpp>
-#include <boost/property_tree/ptree.hpp>
 
 #include <atomic>
+#include <common/prec_timer.h>
 #include <condition_variable>
 #include <future>
-#include <thread>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
+#include <thread>
+#include <utility>
 
 namespace caspar { namespace decklink {
-
-struct configuration
-{
-    enum class keyer_t
-    {
-        internal_keyer,
-        external_keyer,
-        external_separate_device_keyer,
-        default_keyer = external_keyer
-    };
-
-    enum class latency_t
-    {
-        low_latency,
-        normal_latency,
-        default_latency = normal_latency
-    };
-
-    int       device_index      = 1;
-    int       key_device_idx    = 0;
-    bool      embedded_audio    = false;
-    keyer_t   keyer             = keyer_t::default_keyer;
-    latency_t latency           = latency_t::default_latency;
-    bool      key_only          = false;
-    int       base_buffer_depth = 3;
-
-    int buffer_depth() const
-    {
-        return base_buffer_depth + (latency == latency_t::low_latency ? 0 : 1) +
-               (embedded_audio ? 1 : 0); // TODO: Do we need this?
-    }
-
-    int key_device_index() const { return key_device_idx == 0 ? device_index + 1 : key_device_idx; }
-};
 
 template <typename Configuration>
 void set_latency(const com_iface_ptr<Configuration>& config,
@@ -105,11 +73,107 @@ void set_latency(const com_iface_ptr<Configuration>& config,
     }
 }
 
-void set_keyer(const com_iface_ptr<IDeckLinkAttributes>& attributes,
-               const com_iface_ptr<IDeckLinkKeyer>&      decklink_keyer,
-               configuration::keyer_t                    keyer,
-               const std::wstring&                       print)
+com_ptr<IDeckLinkDisplayMode> get_display_mode(const com_iface_ptr<IDeckLinkOutput>& device,
+                                               core::video_format                    fmt,
+                                               BMDPixelFormat                        pix_fmt,
+                                               BMDSupportedVideoModeFlags            flag)
 {
+    auto format = get_decklink_video_format(fmt);
+
+    IDeckLinkDisplayMode*         m = nullptr;
+    IDeckLinkDisplayModeIterator* iter;
+    if (SUCCEEDED(device->GetDisplayModeIterator(&iter))) {
+        auto iterator = wrap_raw<com_ptr>(iter, true);
+        while (SUCCEEDED(iterator->Next(&m)) && m != nullptr && m->GetDisplayMode() != format) {
+            m->Release();
+        }
+    }
+
+    if (!m)
+        CASPAR_THROW_EXCEPTION(user_error()
+                               << msg_info("Device could not find requested video-format: " + std::to_string(format)));
+
+    com_ptr<IDeckLinkDisplayMode> mode = wrap_raw<com_ptr>(m, true);
+
+    BMDDisplayMode actualMode = bmdModeUnknown;
+    BOOL           supported  = false;
+
+    auto displayMode = mode->GetDisplayMode();
+    if (FAILED(device->DoesSupportVideoMode(bmdVideoConnectionUnspecified,
+                                            displayMode,
+                                            pix_fmt,
+                                            bmdNoVideoOutputConversion,
+                                            flag,
+                                            &actualMode,
+                                            &supported)))
+        CASPAR_THROW_EXCEPTION(caspar_exception()
+                               << msg_info(L"Could not determine whether device supports requested video format: " +
+                                           get_mode_name(mode)));
+    else if (!supported)
+        CASPAR_LOG(info) << L"Device may not support video-format: " << get_mode_name(mode);
+    else if (actualMode != bmdModeUnknown && actualMode != displayMode)
+        CASPAR_LOG(warning) << L"Device supports video-format with conversion: " << get_mode_name(mode);
+
+    return mode;
+}
+
+void set_duplex(const com_iface_ptr<IDeckLinkAttributes_v10_11>&    attributes,
+                const com_iface_ptr<IDeckLinkConfiguration_v10_11>& config,
+                configuration::duplex_t                             duplex,
+                const std::wstring&                                 print)
+{
+    BOOL supportsDuplexModeConfiguration;
+    if (FAILED(
+            attributes->GetFlag(static_cast<BMDDeckLinkAttributeID>(BMDDeckLinkSupportsDuplexModeConfiguration_v10_11),
+                                &supportsDuplexModeConfiguration))) {
+        CASPAR_LOG(error) << print
+                          << L" Failed to set duplex mode, unable to check if card supports duplex mode setting.";
+    }
+
+    if (!supportsDuplexModeConfiguration) {
+        CASPAR_LOG(warning) << print << L" This device does not support setting the duplex mode.";
+        return;
+    }
+
+    std::map<configuration::duplex_t, BMDDuplexMode_v10_11> config_map{
+        {configuration::duplex_t::full_duplex, bmdDuplexModeFull_v10_11},
+        {configuration::duplex_t::half_duplex, bmdDuplexModeHalf_v10_11},
+    };
+    auto duplex_mode = config_map[duplex];
+
+    if (FAILED(
+            config->SetInt(static_cast<BMDDeckLinkConfigurationID>(bmdDeckLinkConfigDuplexMode_v10_11), duplex_mode))) {
+        CASPAR_LOG(error) << print << L" Unable to set duplex mode.";
+        return;
+    }
+    CASPAR_LOG(info) << print << L" Duplex mode set.";
+}
+
+void set_keyer(const com_iface_ptr<IDeckLinkProfileAttributes>& attributes,
+               const com_iface_ptr<IDeckLinkOutput>&             output,
+               const com_iface_ptr<IDeckLinkKeyer>&             decklink_keyer,
+               configuration::keyer_t                           keyer,
+               BMDDisplayMode                                   display_mode,
+               BMDPixelFormat                                   pixel_format,
+               const std::wstring&                              print)
+{
+    if (keyer == configuration::keyer_t::internal_keyer || keyer == configuration::keyer_t::external_keyer) {
+        BMDDisplayMode actualMode = bmdModeUnknown;
+        BOOL           supported  = FALSE;
+        if (SUCCEEDED(output->DoesSupportVideoMode(bmdVideoConnectionUnspecified,
+                                                   display_mode,
+                                                   pixel_format,
+                                                   bmdNoVideoOutputConversion,
+                                                   bmdSupportedVideoModeKeying,
+                                                   &actualMode,
+                                                   &supported)) &&
+            !supported) {
+            CASPAR_LOG(warning) << print << L" Keying is not supported by this device for the current video mode. Disabling keyer.";
+            decklink_keyer->Disable();
+            return;
+        }
+    }
+
     if (keyer == configuration::keyer_t::internal_keyer) {
         BOOL value = true;
         if (SUCCEEDED(attributes->GetFlag(BMDDeckLinkSupportsInternalKeying, &value)) && !value)
@@ -133,24 +197,127 @@ void set_keyer(const com_iface_ptr<IDeckLinkAttributes>& attributes,
     }
 }
 
-class decklink_frame : public IDeckLinkVideoFrame
+core::video_format_desc get_decklink_format(const port_configuration&      config,
+                                            const core::video_format_desc& fallback_format_desc)
 {
-    core::video_format_desc format_desc_;
-    std::shared_ptr<void>   data_;
-    std::atomic<int>        ref_count_{0};
-    int                     nb_samples_;
+    if (config.format.format != core::video_format::invalid && config.format.format != fallback_format_desc.format) {
+        if (config.format.format != core::video_format::invalid && config.format.format != core::video_format::custom &&
+            config.format.framerate * config.format.field_count ==
+                fallback_format_desc.framerate * fallback_format_desc.field_count &&
+            config.format.duration == fallback_format_desc.duration) {
+            return config.format;
+        }
+    }
+
+    if (fallback_format_desc.format == core::video_format::invalid ||
+        fallback_format_desc.format == core::video_format::custom)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Decklink does not support the channel format"));
+
+    return fallback_format_desc;
+}
+
+spl::shared_ptr<format_strategy> create_format_strategy(const configuration& config)
+{
+    if (config.hdr) {
+        return create_hdr_v210_strategy(config.color_space);
+    } else {
+        return config.pixel_format == configuration::pixel_format_t::yuv ? create_sdr_v210_strategy(config.color_space)
+                                                                         : create_sdr_bgra_strategy();
+    }
+}
+
+enum EOTF
+{
+    SDR = 0,
+    HDR = 1,
+    PQ  = 2,
+    HLG = 3
+};
+
+struct ChromaticityCoordinates
+{
+    double RedX;
+    double RedY;
+    double GreenX;
+    double GreenY;
+    double BlueX;
+    double BlueY;
+    double WhiteX;
+    double WhiteY;
+};
+
+const auto REC_709  = ChromaticityCoordinates{0.640, 0.330, 0.300, 0.600, 0.150, 0.060, 0.3127, 0.3290};
+const auto REC_2020 = ChromaticityCoordinates{0.708, 0.292, 0.170, 0.797, 0.131, 0.046, 0.3127, 0.3290};
+
+class decklink_frame
+    : public IDeckLinkVideoFrame
+    , public IDeckLinkVideoFrameMetadataExtensions
+{
+    core::video_format_desc                      format_desc_;
+    std::shared_ptr<void>                        data_;
+    std::atomic<int>                             ref_count_{0};
+    int                                          nb_samples_;
+    const bool                                   hdr_;
+    core::color_space                            color_space_;
+    hdr_meta_configuration                       hdr_metadata_;
+    BMDFrameFlags                                flags_;
+    BMDPixelFormat                               pix_fmt_;
+    int                                          row_bytes_;
+    com_ptr<IDeckLinkVideoFrameAncillaryPackets> vanc_;
 
   public:
-    decklink_frame(std::shared_ptr<void> data, const core::video_format_desc& format_desc, int nb_samples)
-        : format_desc_(format_desc)
-        , data_(data)
+    decklink_frame(std::shared_ptr<void>         data,
+                   core::video_format_desc       format_desc,
+                   int                           nb_samples,
+                   bool                          hdr,
+                   BMDPixelFormat                pix_fmt,
+                   int                           row_bytes,
+                   bool                          vanc,
+                   core::color_space             color_space,
+                   const hdr_meta_configuration& hdr_metadata)
+        : format_desc_(std::move(format_desc))
+        , data_(std::move(data))
         , nb_samples_(nb_samples)
+        , hdr_(hdr)
+        , pix_fmt_(pix_fmt)
+        , row_bytes_(row_bytes)
+        , color_space_(color_space)
+        , hdr_metadata_(hdr_metadata)
+        , flags_(hdr ? bmdFrameFlagDefault | bmdFrameContainsHDRMetadata : bmdFrameFlagDefault)
+        , vanc_(vanc ? create_ancillary_packets() : nullptr)
     {
     }
 
     // IUnknown
 
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, LPVOID*) override { return E_NOINTERFACE; }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID* ppv) override
+    {
+        if (ppv == nullptr)
+            return E_INVALIDARG;
+
+        REFIID iunknown = IID_IUnknown;
+
+        if (std::memcmp(&iid, &iunknown, sizeof(REFIID)) == 0) {
+            *ppv = this;
+            AddRef();
+        } else if (std::memcmp(&iid, &IID_IDeckLinkVideoFrame, sizeof(REFIID)) == 0) {
+            *ppv = static_cast<IDeckLinkVideoFrame*>(this);
+            AddRef();
+        } else if (hdr_ && std::memcmp(&iid, &IID_IDeckLinkVideoFrameMetadataExtensions, sizeof(REFIID)) == 0) {
+            *ppv = static_cast<IDeckLinkVideoFrameMetadataExtensions*>(this);
+            AddRef();
+        } else if (vanc_ && std::memcmp(&iid, &IID_IDeckLinkVideoFrameAncillaryPackets, sizeof(REFIID)) == 0) {
+            auto raw = get_raw(vanc_);
+            raw->AddRef();
+            *ppv = raw;
+
+        } else {
+            *ppv = nullptr;
+            return E_NOINTERFACE;
+        }
+
+        return S_OK;
+    }
 
     ULONG STDMETHODCALLTYPE AddRef() override { return ++ref_count_; }
 
@@ -167,11 +334,11 @@ class decklink_frame : public IDeckLinkVideoFrame
 
     // IDecklinkVideoFrame
 
-    long STDMETHODCALLTYPE GetWidth() override { return static_cast<long>(format_desc_.width); }
-    long STDMETHODCALLTYPE GetHeight() override { return static_cast<long>(format_desc_.height); }
-    long STDMETHODCALLTYPE GetRowBytes() override { return static_cast<long>(format_desc_.width * 4); }
-    BMDPixelFormat STDMETHODCALLTYPE GetPixelFormat() override { return bmdFormat8BitBGRA; }
-    BMDFrameFlags STDMETHODCALLTYPE GetFlags() override { return bmdFrameFlagDefault; }
+    long STDMETHODCALLTYPE           GetWidth() override { return static_cast<long>(format_desc_.width); }
+    long STDMETHODCALLTYPE           GetHeight() override { return static_cast<long>(format_desc_.height); }
+    long STDMETHODCALLTYPE           GetRowBytes() override { return static_cast<long>(row_bytes_); }
+    BMDPixelFormat STDMETHODCALLTYPE GetPixelFormat() override { return pix_fmt_; }
+    BMDFrameFlags STDMETHODCALLTYPE  GetFlags() override { return flags_; }
 
     HRESULT STDMETHODCALLTYPE GetBytes(void** buffer) override
     {
@@ -186,26 +353,174 @@ class decklink_frame : public IDeckLinkVideoFrame
 
     HRESULT STDMETHODCALLTYPE GetAncillaryData(IDeckLinkVideoFrameAncillary** ancillary) override { return S_FALSE; }
 
-    int nb_samples() const { return nb_samples_; }
+    [[nodiscard]] int nb_samples() const { return nb_samples_; }
+
+    // IDeckLinkVideoFrameMetadataExtensions
+    HRESULT STDMETHODCALLTYPE GetInt(BMDDeckLinkFrameMetadataID metadataID, int64_t* value) override
+    {
+        HRESULT result = S_OK;
+
+        switch (metadataID) {
+            case bmdDeckLinkFrameMetadataHDRElectroOpticalTransferFunc:
+                *value = EOTF::HLG;
+                break;
+
+            case bmdDeckLinkFrameMetadataColorspace:
+                *value = (color_space_ == core::color_space::bt2020) ? bmdColorspaceRec2020 : bmdColorspaceRec709;
+                break;
+
+            default:
+                value  = nullptr;
+                result = E_INVALIDARG;
+        }
+
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetFloat(BMDDeckLinkFrameMetadataID metadataID, double* value) override
+    {
+        const auto color_space = (color_space_ == core::color_space::bt2020) ? &REC_2020 : &REC_709;
+        HRESULT    result      = S_OK;
+
+        switch (metadataID) {
+            case bmdDeckLinkFrameMetadataHDRDisplayPrimariesRedX:
+                *value = color_space->RedX;
+                break;
+
+            case bmdDeckLinkFrameMetadataHDRDisplayPrimariesRedY:
+                *value = color_space->RedY;
+                break;
+
+            case bmdDeckLinkFrameMetadataHDRDisplayPrimariesGreenX:
+                *value = color_space->GreenX;
+                break;
+
+            case bmdDeckLinkFrameMetadataHDRDisplayPrimariesGreenY:
+                *value = color_space->GreenY;
+                break;
+
+            case bmdDeckLinkFrameMetadataHDRDisplayPrimariesBlueX:
+                *value = color_space->BlueX;
+                break;
+
+            case bmdDeckLinkFrameMetadataHDRDisplayPrimariesBlueY:
+                *value = color_space->BlueY;
+                break;
+
+            case bmdDeckLinkFrameMetadataHDRWhitePointX:
+                *value = color_space->WhiteX;
+                break;
+
+            case bmdDeckLinkFrameMetadataHDRWhitePointY:
+                *value = color_space->WhiteY;
+                break;
+
+            case bmdDeckLinkFrameMetadataHDRMaxDisplayMasteringLuminance:
+                *value = hdr_metadata_.max_dml;
+                break;
+
+            case bmdDeckLinkFrameMetadataHDRMinDisplayMasteringLuminance:
+                *value = hdr_metadata_.min_dml;
+                break;
+
+            case bmdDeckLinkFrameMetadataHDRMaximumContentLightLevel:
+                *value = hdr_metadata_.max_cll;
+                break;
+
+            case bmdDeckLinkFrameMetadataHDRMaximumFrameAverageLightLevel:
+                *value = hdr_metadata_.max_fall;
+                break;
+
+            default:
+                value  = nullptr;
+                result = E_INVALIDARG;
+        }
+
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetFlag(BMDDeckLinkFrameMetadataID, BOOL* value) override
+    {
+        // Not expecting GetFlag
+        *value = false;
+        return E_INVALIDARG;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetString(BMDDeckLinkFrameMetadataID, String* value) override
+    {
+        // Not expecting GetString
+        *value = nullptr;
+        return E_INVALIDARG;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetBytes(BMDDeckLinkFrameMetadataID metadataID,
+                                       void*                      buffer,
+                                       uint32_t*                  bufferSize) override
+    {
+        *bufferSize = 0;
+        return E_INVALIDARG;
+    }
 };
 
-struct key_video_context : public IDeckLinkVideoOutputCallback
+struct decklink_secondary_port final : public IDeckLinkVideoOutputCallback
 {
-    const configuration                   config_;
-    com_ptr<IDeckLink>                    decklink_      = get_device(config_.key_device_index());
-    com_iface_ptr<IDeckLinkOutput>        output_        = iface_cast<IDeckLinkOutput>(decklink_);
-    com_iface_ptr<IDeckLinkKeyer>         keyer_         = iface_cast<IDeckLinkKeyer>(decklink_, true);
-    com_iface_ptr<IDeckLinkAttributes>    attributes_    = iface_cast<IDeckLinkAttributes>(decklink_);
-    com_iface_ptr<IDeckLinkConfiguration> configuration_ = iface_cast<IDeckLinkConfiguration>(decklink_);
-    std::atomic<int64_t>                  scheduled_frames_completed_;
+    const configuration                       config_;
+    const port_configuration                  output_config_;
+    spl::shared_ptr<format_strategy>          format_strategy_;
+    com_ptr<IDeckLink>                        decklink_      = get_device(output_config_.device_index);
+    com_iface_ptr<IDeckLinkOutput>            output_        = iface_cast<IDeckLinkOutput>(decklink_);
+    com_iface_ptr<IDeckLinkKeyer>             keyer_         = iface_cast<IDeckLinkKeyer>(decklink_, true);
+    com_iface_ptr<IDeckLinkProfileAttributes> attributes_    = iface_cast<IDeckLinkProfileAttributes>(decklink_);
+    com_iface_ptr<IDeckLinkConfiguration>     configuration_ = iface_cast<IDeckLinkConfiguration>(decklink_);
+    int                                       device_sync_group_;
+    std::optional<core::const_frame>          first_field_;
 
-    key_video_context(const configuration& config, const std::wstring& print)
+    const std::wstring model_name_ = get_model_name(decklink_);
+
+    // long long video_scheduled_ = 0;
+
+    const core::video_format_desc channel_format_desc_;
+    const core::video_format_desc decklink_format_desc_;
+    com_ptr<IDeckLinkDisplayMode> mode_ = get_display_mode(output_,
+                                                           decklink_format_desc_.format,
+                                                           format_strategy_->get_pixel_format(),
+                                                           bmdSupportedVideoModeDefault);
+
+    decklink_secondary_port(const configuration&           config,
+                            port_configuration             output_config,
+                            core::video_format_desc        channel_format_desc,
+                            const core::video_format_desc& main_decklink_format_desc,
+                            const std::wstring&            print,
+                            int                            device_sync_group)
         : config_(config)
+        , output_config_(std::move(output_config))
+        , format_strategy_(create_format_strategy(config))
+        , device_sync_group_(device_sync_group)
+        , channel_format_desc_(std::move(channel_format_desc))
+        , decklink_format_desc_(get_decklink_format(output_config_, main_decklink_format_desc))
     {
-        scheduled_frames_completed_ = 0;
+        if (main_decklink_format_desc.format != decklink_format_desc_.format) {
+            CASPAR_LOG(info) << print << L" Disabling sync group for output with different format.";
+            device_sync_group_ = 0;
+        }
+
+        if (config.duplex != configuration::duplex_t::default_duplex) {
+            set_duplex(iface_cast<IDeckLinkAttributes_v10_11>(decklink_),
+                       iface_cast<IDeckLinkConfiguration_v10_11>(decklink_),
+                       config.duplex,
+                       print);
+        }
 
         set_latency(configuration_, config.latency, print);
-        set_keyer(attributes_, keyer_, config.keyer, print);
+        set_keyer(attributes_, output_, keyer_, config.keyer, mode_->GetDisplayMode(), format_strategy_->get_pixel_format(), print);
+
+        if (device_sync_group_ > 0 &&
+            FAILED(configuration_->SetInt(bmdDeckLinkConfigPlaybackGroup, device_sync_group_))) {
+            CASPAR_LOG(error) << print << L" Failed to enable sync group.";
+            device_sync_group_ = 0;
+        } else {
+            CASPAR_LOG(trace) << print << L" Joined sync group " << device_sync_group;
+        }
 
         if (FAILED(output_->SetScheduledFrameCompletionCallback(this)))
             CASPAR_THROW_EXCEPTION(caspar_exception()
@@ -213,64 +528,130 @@ struct key_video_context : public IDeckLinkVideoOutputCallback
                                    << boost::errinfo_api_function("SetScheduledFrameCompletionCallback"));
     }
 
-    template <typename Print>
-    void enable_video(BMDDisplayMode display_mode, const Print& print)
-    {
-        if (FAILED(output_->EnableVideoOutput(display_mode, bmdVideoOutputFlagDefault)))
-            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info(print() + L" Could not enable key video output."));
-
-        if (FAILED(output_->SetScheduledFrameCompletionCallback(this)))
-            CASPAR_THROW_EXCEPTION(caspar_exception()
-                                   << msg_info(print() + L" Failed to set key playback completion callback.")
-                                   << boost::errinfo_api_function("SetScheduledFrameCompletionCallback"));
-    }
-
-    virtual ~key_video_context()
+    ~decklink_secondary_port()
     {
         if (output_) {
-            output_->StopScheduledPlayback(0, nullptr, 0);
+            if (device_sync_group_ == 0) {
+                output_->StopScheduledPlayback(0, nullptr, 0);
+            }
+
             output_->DisableVideoOutput();
         }
     }
 
+    [[nodiscard]] std::wstring print() const
+    {
+        return model_name_ + L" [" + std::to_wstring(output_config_.device_index) + L"|" + decklink_format_desc_.name +
+               L"]";
+    }
+
+    template <typename Print>
+    void enable_video(const Print& print)
+    {
+        if (FAILED(output_->EnableVideoOutput(mode_->GetDisplayMode(),
+                                              device_sync_group_ > 0 ? bmdVideoOutputSynchronizeToPlaybackGroup
+                                                                     : bmdVideoOutputFlagDefault)))
+            CASPAR_THROW_EXCEPTION(caspar_exception()
+                                   << msg_info(print() + L" Could not enable secondary video output."));
+    }
+
+    template <typename Print>
+    void start_playback(const Print& print)
+    {
+        if (device_sync_group_ == 0) {
+            if (FAILED(output_->StartScheduledPlayback(0, decklink_format_desc_.time_scale, 1.0))) {
+                CASPAR_THROW_EXCEPTION(caspar_exception()
+                                       << msg_info(print() + L" Failed to schedule secondary playback."));
+            }
+        }
+    }
+
+    void schedule_frame(core::const_frame frame, BMDTimeValue display_time)
+    {
+        bool isInterlaced = decklink_format_desc_.field_count != 1;
+        if (isInterlaced && !first_field_.has_value()) {
+            // If this is interlaced it needs a pair of frames at a time
+            first_field_ = frame;
+            return;
+        }
+
+        // Figure out which frame is which
+        core::const_frame frame1;
+        core::const_frame frame2;
+        if (isInterlaced) {
+            frame1       = *first_field_;
+            first_field_ = {};
+            frame2       = frame;
+        } else {
+            frame1 = frame;
+        }
+
+        auto image_data = format_strategy_->convert_frame_for_port(
+            channel_format_desc_, decklink_format_desc_, output_config_, frame1, frame2, mode_->GetFieldDominance());
+
+        schedule_next_video(image_data, 0, display_time);
+    }
+
+    void schedule_next_video(std::shared_ptr<void> image_data, int nb_samples, BMDTimeValue display_time)
+    {
+        auto packed_frame = wrap_raw<com_ptr, IDeckLinkVideoFrame>(
+            new decklink_frame(std::move(image_data),
+                               decklink_format_desc_,
+                               nb_samples,
+                               config_.hdr,
+                               format_strategy_->get_pixel_format(),
+                               format_strategy_->get_row_bytes(decklink_format_desc_.width),
+                               false,
+                               config_.color_space,
+                               config_.hdr_meta));
+        if (FAILED(output_->ScheduleVideoFrame(get_raw(packed_frame),
+                                               display_time,
+                                               decklink_format_desc_.duration,
+                                               decklink_format_desc_.time_scale))) {
+            CASPAR_LOG(error) << print() << L" Failed to schedule primary video.";
+        }
+
+        // video_scheduled_ += decklink_format_desc_.duration;
+    }
+
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, LPVOID*) override { return E_NOINTERFACE; }
-    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
-    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    ULONG STDMETHODCALLTYPE   AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE   Release() override { return 1; }
 
     HRESULT STDMETHODCALLTYPE ScheduledPlaybackHasStopped() override { return S_OK; }
 
     HRESULT STDMETHODCALLTYPE ScheduledFrameCompleted(IDeckLinkVideoFrame*           completed_frame,
                                                       BMDOutputFrameCompletionResult result) override
     {
-        ++scheduled_frames_completed_;
-
-        // Let the fill callback keep the pace, so no scheduling here.
+        // Let the primary callback keep the pace, so no scheduling here.
 
         return S_OK;
     }
 };
 
-struct decklink_consumer : public IDeckLinkVideoOutputCallback
+struct decklink_consumer final : public IDeckLinkVideoOutputCallback
 {
-    const int           channel_index_;
-    const configuration config_;
+    const int                        channel_index_;
+    const configuration              config_;
+    spl::shared_ptr<format_strategy> format_strategy_;
 
-    com_ptr<IDeckLink>                    decklink_      = get_device(config_.device_index);
-    com_iface_ptr<IDeckLinkOutput>        output_        = iface_cast<IDeckLinkOutput>(decklink_);
-    com_iface_ptr<IDeckLinkConfiguration> configuration_ = iface_cast<IDeckLinkConfiguration>(decklink_);
-    com_iface_ptr<IDeckLinkKeyer>         keyer_         = iface_cast<IDeckLinkKeyer>(decklink_, true);
-    com_iface_ptr<IDeckLinkAttributes>    attributes_    = iface_cast<IDeckLinkAttributes>(decklink_);
+    com_ptr<IDeckLink>                        decklink_      = get_device(config_.primary.device_index);
+    com_iface_ptr<IDeckLinkOutput>            output_        = iface_cast<IDeckLinkOutput>(decklink_);
+    com_iface_ptr<IDeckLinkConfiguration>     configuration_ = iface_cast<IDeckLinkConfiguration>(decklink_);
+    com_iface_ptr<IDeckLinkKeyer>             keyer_         = iface_cast<IDeckLinkKeyer>(decklink_, true);
+    com_iface_ptr<IDeckLinkProfileAttributes> attributes_    = iface_cast<IDeckLinkProfileAttributes>(decklink_);
 
     std::mutex         exception_mutex_;
     std::exception_ptr exception_;
 
     const std::wstring            model_name_ = get_model_name(decklink_);
-    const core::video_format_desc format_desc_;
+    const core::video_format_desc channel_format_desc_;
+    const core::video_format_desc decklink_format_desc_;
 
     std::mutex                    buffer_mutex_;
     std::condition_variable       buffer_cond_;
     std::queue<core::const_frame> buffer_;
-    int                           buffer_capacity_ = 1;
+    int                           buffer_capacity_ = channel_format_desc_.field_count;
 
     const int buffer_size_ = config_.buffer_depth(); // Minimum buffer-size 3.
 
@@ -282,42 +663,26 @@ struct decklink_consumer : public IDeckLinkVideoOutputCallback
     spl::shared_ptr<diagnostics::graph> graph_;
     caspar::timer                       tick_timer_;
     reference_signal_detector           reference_signal_detector_{output_};
-    std::atomic<int64_t>                scheduled_frames_completed_{0};
-    std::unique_ptr<key_video_context>  key_context_;
+    // std::atomic<int64_t>                                  scheduled_frames_completed_{0};
+    std::vector<std::unique_ptr<decklink_secondary_port>> secondary_port_contexts_;
+    int                                                   device_sync_group_ = 0;
 
-    com_ptr<IDeckLinkDisplayMode> mode_ =
-        get_display_mode(output_, format_desc_.format, bmdFormat8BitBGRA, bmdVideoOutputFlagDefault);
-    int field_count_ = mode_->GetFieldDominance() != bmdProgressiveFrame ? 2 : 1;
+    com_ptr<IDeckLinkDisplayMode> mode_ = get_display_mode(output_,
+                                                           decklink_format_desc_.format,
+                                                           format_strategy_->get_pixel_format(),
+                                                           bmdSupportedVideoModeDefault);
 
-    std::atomic<bool> abort_request_{false};
-
-    bool doFrame(std::shared_ptr<void>& image_data, std::vector<std::int32_t>& audio_data, bool topField)
-    {
-        core::const_frame frame(pop());
-        if (abort_request_)
-            return false;
-
-        int firstLine = topField ? 0 : 1;
-        for (auto y = firstLine; y < format_desc_.height; y += field_count_) {
-            std::memcpy(reinterpret_cast<char*>(image_data.get()) + (long long)y * format_desc_.width * 4,
-                        frame.image_data(0).data() + (long long)y * format_desc_.width * 4,
-                        (size_t)format_desc_.width * 4);
-        }
-        audio_data.insert(audio_data.end(), frame.audio_data().begin(), frame.audio_data().end());
-
-        return true;
-    }
+    std::atomic<bool>              abort_request_{false};
+    std::shared_ptr<decklink_vanc> vanc_;
 
   public:
-    decklink_consumer(const configuration& config, const core::video_format_desc& format_desc, int channel_index)
+    decklink_consumer(const configuration& config, core::video_format_desc channel_format_desc, int channel_index)
         : channel_index_(channel_index)
         , config_(config)
-        , format_desc_(format_desc)
+        , format_strategy_(create_format_strategy(config))
+        , channel_format_desc_(std::move(channel_format_desc))
+        , decklink_format_desc_(get_decklink_format(config.primary, channel_format_desc_))
     {
-        if (config.keyer == configuration::keyer_t::external_separate_device_keyer) {
-            key_context_.reset(new key_video_context(config, print()));
-        }
-
         graph_->set_color("tick-time", diagnostics::color(0.0f, 0.6f, 0.9f));
         graph_->set_color("late-frame", diagnostics::color(0.6f, 0.3f, 0.3f));
         graph_->set_color("dropped-frame", diagnostics::color(0.3f, 0.6f, 0.3f));
@@ -325,43 +690,102 @@ struct decklink_consumer : public IDeckLinkVideoOutputCallback
         graph_->set_color("buffered-audio", diagnostics::color(0.9f, 0.9f, 0.5f));
         graph_->set_color("buffered-video", diagnostics::color(0.2f, 0.9f, 0.9f));
 
-        if (mode_->GetFieldDominance() != bmdProgressiveFrame) {
-            graph_->set_color("tick-time-f2", diagnostics::color(0.9f, 0.6f, 0.0f));
+        if (config.duplex != configuration::duplex_t::default_duplex) {
+            set_duplex(iface_cast<IDeckLinkAttributes_v10_11>(decklink_),
+                       iface_cast<IDeckLinkConfiguration_v10_11>(decklink_),
+                       config.duplex,
+                       print());
         }
 
+        /*
         if (key_context_) {
             graph_->set_color("key-offset", diagnostics::color(1.0f, 0.0f, 0.0f));
         }
+        */
 
         graph_->set_text(print());
         diagnostics::register_graph(graph_);
 
-        enable_video(mode_->GetDisplayMode());
+        // If there are additional ports devices, then enable the sync group
+        if (!config.secondaries.empty()) {
+            // A unique id is needed for this group, this is simpler than a random number
+            device_sync_group_ = static_cast<int>(config.primary.device_index);
+
+            if (FAILED(configuration_->SetInt(bmdDeckLinkConfigPlaybackGroup, device_sync_group_))) {
+                device_sync_group_ = 0;
+                CASPAR_LOG(error) << print() << L" Failed to enable sync group.";
+            } else {
+                CASPAR_LOG(debug) << print() << L" Enabled sync group: " << device_sync_group_;
+            }
+        }
+
+        // create the secondary ports
+        for (auto& secondary_port_config : config_.secondaries) {
+            secondary_port_contexts_.push_back(std::make_unique<decklink_secondary_port>(config,
+                                                                                         secondary_port_config,
+                                                                                         channel_format_desc_,
+                                                                                         decklink_format_desc_,
+                                                                                         print(),
+                                                                                         device_sync_group_));
+        }
+
+        if (config.vanc.enable) {
+            BOOL flag = TRUE;
+            attributes_->GetFlag(BMDDeckLinkVANCRequires10BitYUVVideoFrames, &flag);
+            if (flag) {
+                CASPAR_LOG(warning) << print()
+                                    << L" DeckLink hardware only supports VANC when the active picture and ancillary "
+                                       L"data are both 10-bit YUV pixel format.";
+            } else {
+                CASPAR_LOG(info) << print() << L" DeckLink hardware supports VANC.";
+                vanc_ = create_vanc(config.vanc);
+            }
+        }
+
+        enable_video();
 
         if (config.embedded_audio) {
             enable_audio();
         }
 
         set_latency(configuration_, config.latency, print());
-        set_keyer(attributes_, keyer_, config.keyer, print());
+        set_keyer(attributes_, output_, keyer_, config.keyer, mode_->GetDisplayMode(), format_strategy_->get_pixel_format(), print());
+
+        if (config.hdr) {
+            BOOL flag = FALSE;
+            if (SUCCEEDED(attributes_->GetFlag(BMDDeckLinkSupportsHDRMetadata, &flag)) && !flag)
+                CASPAR_LOG(error) << print() << L" Device does not support HDR metadata.";
+            if (SUCCEEDED(attributes_->GetFlag(BMDDeckLinkSupportsColorspaceMetadata, &flag)) && !flag)
+                CASPAR_LOG(warning) << print() << L" Device does not support colorspace metadata.";
+        }
 
         if (config.embedded_audio) {
             output_->BeginAudioPreroll();
         }
 
         for (int n = 0; n < buffer_size_; ++n) {
-            auto nb_samples = format_desc_.audio_cadence[n % format_desc_.audio_cadence.size()] * field_count_;
+            auto nb_samples = decklink_format_desc_.audio_cadence[n % decklink_format_desc_.audio_cadence.size()] *
+                              decklink_format_desc_.field_count;
             if (config.embedded_audio) {
-                schedule_next_audio(std::vector<int32_t>(nb_samples * format_desc_.audio_channels), nb_samples);
+                schedule_next_audio(std::vector<int32_t>(nb_samples * decklink_format_desc_.audio_channels),
+                                    nb_samples);
             }
 
-            std::shared_ptr<void> image_data(scalable_aligned_malloc(format_desc_.size, 64), scalable_aligned_free);
-            schedule_next_video(image_data, nb_samples);
+            std::shared_ptr<void> image_data = format_strategy_->allocate_frame_data(decklink_format_desc_);
+
+            schedule_next_video(image_data, nb_samples, video_scheduled_);
+            for (auto& context : secondary_port_contexts_) {
+                context->schedule_next_video(image_data, 0, video_scheduled_);
+            }
+
+            video_scheduled_ += decklink_format_desc_.duration;
         }
 
         if (config.embedded_audio) {
             output_->EndAudioPreroll();
         }
+
+        wait_for_reference_lock();
 
         start_playback();
     }
@@ -378,13 +802,57 @@ struct decklink_consumer : public IDeckLinkVideoOutputCallback
             }
             output_->DisableVideoOutput();
         }
+
+        secondary_port_contexts_.clear();
+    }
+
+    void wait_for_reference_lock()
+    {
+        if (config_.wait_for_reference_duration == 0 ||
+            config_.wait_for_reference == configuration::wait_for_reference_t::disabled) {
+            // Wait disabled
+            return;
+        }
+        if (config_.wait_for_reference == configuration::wait_for_reference_t::automatic && device_sync_group_ == 0) {
+            // Wait is not necessary
+            return;
+        }
+
+        CASPAR_LOG(info) << print() << L" Reference signal: waiting for lock";
+
+        // When using the sync group we need a reference lock before starting playback, otherwise the outputs will not
+        // be locked correctly and will be out of sync
+        auto wait_end = std::chrono::system_clock::now() + std::chrono::seconds(config_.wait_for_reference_duration);
+        while (std::chrono::system_clock::now() < wait_end) {
+            BMDReferenceStatus reference_status;
+            if (output_->GetReferenceStatus(&reference_status) != S_OK) {
+                CASPAR_LOG(error) << print() << L" Reference signal: failed while querying status";
+                break;
+            }
+
+            if (reference_status & bmdReferenceNotSupportedByHardware) {
+                CASPAR_LOG(info) << print() << L" Reference signal: not supported by hardware.";
+                break;
+            } else if (reference_status & bmdReferenceLocked) {
+                CASPAR_LOG(info) << print() << L" Reference signal: locked";
+
+                // TODO - is this necessary? This is to give it a chance to stabilise before continuing
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+                return;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        CASPAR_LOG(warning) << print() << L" Reference signal: unable to acquire lock";
     }
 
     void enable_audio()
     {
         if (FAILED(output_->EnableAudioOutput(bmdAudioSampleRate48kHz,
                                               bmdAudioSampleType32bitInteger,
-                                              format_desc_.audio_channels,
+                                              decklink_format_desc_.audio_channels,
                                               bmdAudioOutputStreamTimestamped))) {
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info(print() + L" Could not enable audio output."));
         }
@@ -392,37 +860,46 @@ struct decklink_consumer : public IDeckLinkVideoOutputCallback
         CASPAR_LOG(info) << print() << L" Enabled embedded-audio.";
     }
 
-    void enable_video(BMDDisplayMode display_mode)
+    void enable_video()
     {
-        if (FAILED(output_->EnableVideoOutput(display_mode, bmdVideoOutputFlagDefault))) {
-            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info(print() + L" Could not enable fill video output."));
+        BMDVideoOutputFlags output_flags = bmdVideoOutputFlagDefault;
+        if (device_sync_group_ > 0) {
+            output_flags = static_cast<BMDVideoOutputFlags>(output_flags | bmdVideoOutputSynchronizeToPlaybackGroup);
+        }
+        if (vanc_) {
+            output_flags = static_cast<BMDVideoOutputFlags>(output_flags | bmdVideoOutputVANC);
+        }
+
+        if (FAILED(output_->EnableVideoOutput(mode_->GetDisplayMode(), output_flags))) {
+            CASPAR_THROW_EXCEPTION(caspar_exception()
+                                   << msg_info(print() + L" Could not enable primary video output."));
         }
 
         if (FAILED(output_->SetScheduledFrameCompletionCallback(this))) {
             CASPAR_THROW_EXCEPTION(caspar_exception()
-                                   << msg_info(print() + L" Failed to set fill playback completion callback.")
+                                   << msg_info(print() + L" Failed to set primary playback completion callback.")
                                    << boost::errinfo_api_function("SetScheduledFrameCompletionCallback"));
         }
 
-        if (key_context_) {
-            key_context_->enable_video(display_mode, [this]() { return print(); });
+        for (auto& context : secondary_port_contexts_) {
+            context->enable_video([this]() { return print(); });
         }
     }
 
     void start_playback()
     {
-        if (FAILED(output_->StartScheduledPlayback(0, format_desc_.time_scale, 1.0))) {
-            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info(print() + L" Failed to schedule fill playback."));
+        if (FAILED(output_->StartScheduledPlayback(0, decklink_format_desc_.time_scale, 1.0))) {
+            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info(print() + L" Failed to schedule primary playback."));
         }
 
-        if (key_context_ && FAILED(key_context_->output_->StartScheduledPlayback(0, format_desc_.time_scale, 1.0))) {
-            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info(print() + L" Failed to schedule key playback."));
+        for (auto& context : secondary_port_contexts_) {
+            context->start_playback([this]() { return print(); });
         }
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, LPVOID*) override { return E_NOINTERFACE; }
-    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
-    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    ULONG STDMETHODCALLTYPE   AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE   Release() override { return 1; }
 
     HRESULT STDMETHODCALLTYPE ScheduledPlaybackHasStopped() override
     {
@@ -433,44 +910,39 @@ struct decklink_consumer : public IDeckLinkVideoOutputCallback
     HRESULT STDMETHODCALLTYPE ScheduledFrameCompleted(IDeckLinkVideoFrame*           completed_frame,
                                                       BMDOutputFrameCompletionResult result) override
     {
-#ifdef WIN32
         thread_local auto priority_set = false;
         if (!priority_set) {
             priority_set = true;
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            // set_thread_realtime_priority();
+            set_thread_name(L"decklink_consumer[" + std::to_wstring(config_.primary.device_index) +
+                            L"]-ScheduledFrameCompleted");
         }
-#endif
         try {
-            auto elapsed     = tick_timer_.elapsed();
-            int  fieldTimeMs = static_cast<int>(1000 / format_desc_.fps);
-            // Calculate a time point for when a simulated second field action should occur for interlaced standards.
-            // The tick_timer will run at frame (2x field) rate. If the tick_timer has been delayed because the machine
-            // is busy this calculation reduces the delay before the second field so that it lands at the expected time,
-            // giving the channel the full amount of time to process the following frame.
-            std::chrono::high_resolution_clock::time_point f2TimePoint =
-                std::chrono::high_resolution_clock::now() +
-                std::chrono::milliseconds(std::max<int>(
-                    0, std::min<int>(fieldTimeMs, fieldTimeMs + static_cast<int>(2.0 * fieldTimeMs - elapsed))));
-
-            auto tick_time = elapsed * format_desc_.fps / field_count_ * 0.5;
+            auto tick_time = tick_timer_.elapsed() * decklink_format_desc_.hz * 0.5;
             graph_->set_value("tick-time", tick_time);
             tick_timer_.restart();
 
             reference_signal_detector_.detect_change([this]() { return print(); });
 
             auto dframe = reinterpret_cast<decklink_frame*>(completed_frame);
-            ++scheduled_frames_completed_;
+            // ++scheduled_frames_completed_;
 
+            /*
             if (key_context_) {
                 graph_->set_value(
                     "key-offset",
                     static_cast<double>(scheduled_frames_completed_ - key_context_->scheduled_frames_completed_) * 0.1 +
                         0.5);
             }
+            */
+
+            /**
+             * TODO - track how the secondaries are doing by comparing IDeckLinkOutput::GetScheduledStreamTime
+             */
 
             if (result == bmdOutputFrameDisplayedLate) {
                 graph_->set_tag(diagnostics::tag_severity::WARNING, "late-frame");
-                video_scheduled_ += format_desc_.duration * field_count_;
+                video_scheduled_ += decklink_format_desc_.duration;
                 audio_scheduled_ += dframe->nb_samples();
             } else if (result == bmdOutputFrameDropped) {
                 graph_->set_tag(diagnostics::tag_severity::WARNING, "dropped-frame");
@@ -487,37 +959,67 @@ struct decklink_consumer : public IDeckLinkVideoOutputCallback
                     output_->GetBufferedAudioSampleFrameCount(&buffered);
                     graph_->set_value("buffered-audio",
                                       static_cast<double>(buffered) /
-                                          (format_desc_.audio_cadence[0] * field_count_ * config_.buffer_depth()));
+                                          (decklink_format_desc_.audio_cadence[0] * decklink_format_desc_.field_count *
+                                           config_.buffer_depth()));
                 }
             }
 
-            std::shared_ptr<void>     image_data(scalable_aligned_malloc(format_desc_.size, 64), scalable_aligned_free);
-            std::vector<std::int32_t> audio_data;
+            core::const_frame frame1 = pop();
+            core::const_frame frame2;
 
+            bool isInterlaced = mode_->GetFieldDominance() != bmdProgressiveFrame;
             if (mode_->GetFieldDominance() != bmdProgressiveFrame) {
-                if (!doFrame(image_data, audio_data, mode_->GetFieldDominance() == bmdUpperFieldFirst))
-                    return E_FAIL;
-
-                // Wait to pull frame for second field...
-                std::this_thread::sleep_until(f2TimePoint);
-
-                tick_time = tick_timer_.elapsed() * format_desc_.fps * 0.5;
-                graph_->set_value("tick-time-f2", tick_time);
-
-                if (!doFrame(image_data, audio_data, mode_->GetFieldDominance() != bmdUpperFieldFirst))
-                    return E_FAIL;
-            } else {
-                if (!doFrame(image_data, audio_data, true))
-                    return E_FAIL;
+                // If the main is not progressive, then pop the second frame
+                frame2 = pop();
             }
 
-            const auto nb_samples = static_cast<int>(audio_data.size()) / format_desc_.audio_channels;
+            if (abort_request_)
+                return E_FAIL;
 
-            schedule_next_video(image_data, nb_samples);
+            BMDTimeValue video_display_time = video_scheduled_;
+            video_scheduled_ += decklink_format_desc_.duration;
 
+            std::vector<std::int32_t> audio_data;
             if (config_.embedded_audio) {
-                schedule_next_audio(std::move(audio_data), nb_samples);
+                audio_data.insert(audio_data.end(), frame1.audio_data().begin(), frame1.audio_data().end());
+                if (isInterlaced) {
+                    audio_data.insert(audio_data.end(), frame2.audio_data().begin(), frame2.audio_data().end());
+                }
             }
+            // TODO: is this reliable?
+            const int nb_samples = static_cast<int>(audio_data.size()) / decklink_format_desc_.audio_channels;
+
+            // Schedule video
+            tbb::parallel_for(-1, static_cast<int>(secondary_port_contexts_.size()), [&](int i) {
+                if (i == -1) {
+                    // Primary port
+                    std::shared_ptr<void> image_data =
+                        format_strategy_->convert_frame_for_port(channel_format_desc_,
+                                                                 decklink_format_desc_,
+                                                                 config_.primary,
+                                                                 frame1,
+                                                                 frame2,
+                                                                 mode_->GetFieldDominance());
+
+                    schedule_next_video(image_data, nb_samples, video_display_time);
+
+                    if (config_.embedded_audio) {
+                        schedule_next_audio(std::move(audio_data), nb_samples);
+                    }
+                } else {
+                    // Send frame to secondary ports
+                    auto& context = secondary_port_contexts_[i];
+                    context->schedule_frame(frame1, video_display_time);
+                    if (isInterlaced) {
+                        context->schedule_frame(frame2, video_display_time);
+                    }
+
+                    if (config_.embedded_audio) {
+                        // TODO - audio for secondaries?
+                    }
+                }
+            });
+
         } catch (...) {
             std::lock_guard<std::mutex> lock(exception_mutex_);
             exception_ = std::current_exception();
@@ -534,7 +1036,7 @@ struct decklink_consumer : public IDeckLinkVideoOutputCallback
             std::unique_lock<std::mutex> lock(buffer_mutex_);
             buffer_cond_.wait(lock, [&] { return !buffer_.empty() || abort_request_; });
             if (!abort_request_) {
-                frame = std::move(buffer_.front());
+                frame = buffer_.front();
                 buffer_.pop();
             }
         }
@@ -551,50 +1053,54 @@ struct decklink_consumer : public IDeckLinkVideoOutputCallback
         if (FAILED(output_->ScheduleAudioSamples(audio_container_.back().data(),
                                                  nb_samples,
                                                  audio_scheduled_,
-                                                 format_desc_.audio_sample_rate,
+                                                 decklink_format_desc_.audio_sample_rate,
                                                  nullptr))) {
             CASPAR_LOG(error) << print() << L" Failed to schedule audio.";
         }
 
-        audio_scheduled_ += nb_samples;
+        audio_scheduled_ += nb_samples; // TODO - what if there are too many/few samples in this frame?
     }
 
-    void schedule_next_video(std::shared_ptr<void> fill, int nb_samples)
+    void schedule_next_video(std::shared_ptr<void> image_data, int nb_samples, BMDTimeValue display_time)
     {
-        std::shared_ptr<void> key;
+        auto fmt        = format_strategy_->get_pixel_format();
+        auto row_bytes  = format_strategy_->get_row_bytes(decklink_format_desc_.width);
+        auto fill_frame = wrap_raw<com_ptr, IDeckLinkVideoFrame>(new decklink_frame(std::move(image_data),
+                                                                                    decklink_format_desc_,
+                                                                                    nb_samples,
+                                                                                    config_.hdr,
+                                                                                    fmt,
+                                                                                    row_bytes,
+                                                                                    config_.vanc.enable,
+                                                                                    config_.color_space,
+                                                                                    config_.hdr_meta));
 
-        if (key_context_ || config_.key_only) {
-            key = std::shared_ptr<void>(scalable_aligned_malloc(format_desc_.size, 64), scalable_aligned_free);
+        if (vanc_ && vanc_->has_data()) {
+            auto ancillary_packets = iface_cast<IDeckLinkVideoFrameAncillaryPackets>(fill_frame);
+            auto packets           = vanc_->pop_packets();
+            for (auto& packet : packets) {
+                if (FAILED(ancillary_packets->AttachPacket(get_raw(packet)))) {
+                    CASPAR_LOG(error) << print() << L" Failed to add ancillary packet.";
+                }
+            }
 
-            aligned_memshfl(key.get(), fill.get(), format_desc_.size, 0x0F0F0F0F, 0x0B0B0B0B, 0x07070707, 0x03030303);
-
-            if (config_.key_only) {
-                fill = key;
+            bool isInterlaced = mode_->GetFieldDominance() != bmdProgressiveFrame;
+            if (isInterlaced) {
+                auto field2_packets = vanc_->pop_packets(true);
+                for (auto& packet : field2_packets) {
+                    if (FAILED(ancillary_packets->AttachPacket(get_raw(packet)))) {
+                        CASPAR_LOG(error) << print() << L" Failed to add ancillary packet.";
+                    }
+                }
             }
         }
-
-        if (key_context_) {
-            auto key_frame = wrap_raw<com_ptr, IDeckLinkVideoFrame>(new decklink_frame(key, format_desc_, nb_samples));
-            if (FAILED(key_context_->output_->ScheduleVideoFrame(get_raw(key_frame),
-                                                                 video_scheduled_,
-                                                                 format_desc_.duration * field_count_,
-                                                                 format_desc_.time_scale))) {
-                CASPAR_LOG(error) << print() << L" Failed to schedule key video.";
-            }
+        if (FAILED(output_->ScheduleVideoFrame(
+                get_raw(fill_frame), display_time, decklink_format_desc_.duration, decklink_format_desc_.time_scale))) {
+            CASPAR_LOG(error) << print() << L" Failed to schedule primary video.";
         }
-
-        auto fill_frame = wrap_raw<com_ptr, IDeckLinkVideoFrame>(new decklink_frame(fill, format_desc_, nb_samples));
-        if (FAILED(output_->ScheduleVideoFrame(get_raw(fill_frame),
-                                               video_scheduled_,
-                                               format_desc_.duration * field_count_,
-                                               format_desc_.time_scale))) {
-            CASPAR_LOG(error) << print() << L" Failed to schedule fill video.";
-        }
-
-        video_scheduled_ += format_desc_.duration * field_count_;
     }
 
-    bool send(core::const_frame frame)
+    bool send(core::video_field field, core::const_frame frame)
     {
         {
             std::lock_guard<std::mutex> lock(exception_mutex_);
@@ -603,10 +1109,12 @@ struct decklink_consumer : public IDeckLinkVideoOutputCallback
             }
         }
 
-        if (frame)
-        {
+        if (frame) {
             std::unique_lock<std::mutex> lock(buffer_mutex_);
-            buffer_cond_.wait(lock, [&] { return buffer_.size() < buffer_capacity_ || abort_request_; });
+            if (field != core::video_field::b) {
+                // Always push a field2, as we have supplied field1
+                buffer_cond_.wait(lock, [&] { return buffer_.size() < buffer_capacity_ || abort_request_; });
+            }
             buffer_.push(std::move(frame));
         }
         buffer_cond_.notify_all();
@@ -614,15 +1122,33 @@ struct decklink_consumer : public IDeckLinkVideoOutputCallback
         return !abort_request_;
     }
 
-    std::wstring print() const
+    bool call(const std::vector<std::wstring>& params)
     {
-        if (config_.keyer == configuration::keyer_t::external_separate_device_keyer) {
-            return model_name_ + L" [" + std::to_wstring(channel_index_) + L"-" +
-                   std::to_wstring(config_.device_index) + L"&&" + std::to_wstring(config_.key_device_index()) + L"|" +
-                   format_desc_.name + L"]";
+        try {
+            bool result = vanc_->try_push_data(params);
+            if (!result) {
+                CASPAR_LOG(warning) << print() << L" Unknown command: " << (params.empty() ? L"N/A" : params[0]);
+            }
+
+            return result;
+        } catch (...) {
+            CASPAR_LOG(warning) << print() << L" Failed to apply: " << (params.empty() ? L"N/A" : params[0]);
         }
-        return model_name_ + L" [" + std::to_wstring(channel_index_) + L"-" + std::to_wstring(config_.device_index) +
-               L"|" + format_desc_.name + L"]";
+        return false;
+    }
+
+    [[nodiscard]] std::wstring print() const
+    {
+        std::wstringstream buffer;
+
+        buffer << model_name_ << L" [" + std::to_wstring(channel_index_) << L"-"
+               << std::to_wstring(config_.primary.device_index) << L"|" << decklink_format_desc_.name << L"]";
+
+        for (auto& context : secondary_port_contexts_) {
+            buffer << L" && " + context->print();
+        }
+
+        return buffer.str();
     }
 };
 
@@ -636,104 +1162,90 @@ struct decklink_consumer_proxy : public core::frame_consumer
   public:
     explicit decklink_consumer_proxy(const configuration& config)
         : config_(config)
-        , executor_(L"decklink_consumer[" + std::to_wstring(config.device_index) + L"]")
+        , executor_(L"decklink_consumer[" + std::to_wstring(config.primary.device_index) + L"]")
     {
         executor_.begin_invoke([=] { com_initialize(); });
     }
 
-    ~decklink_consumer_proxy()
+    ~decklink_consumer_proxy() override
     {
-        executor_.invoke([=] {
-#ifdef WIN32
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-#endif
+        executor_.invoke([=, this] {
+            set_thread_realtime_priority();
             consumer_.reset();
             com_uninitialize();
         });
     }
 
-    void initialize(const core::video_format_desc& format_desc, int channel_index) override
+    void initialize(const core::video_format_desc& format_desc,
+                    const core::channel_info&      channel_info,
+                    int                            port_index) override
     {
         format_desc_ = format_desc;
-        executor_.invoke([=] {
+        executor_.invoke([=, this] {
             consumer_.reset();
-            consumer_.reset(new decklink_consumer(config_, format_desc, channel_index));
+            consumer_ = std::make_unique<decklink_consumer>(config_, format_desc, channel_info.index);
         });
     }
 
-    std::future<bool> send(core::const_frame frame) override
+    std::future<bool> send(core::video_field field, core::const_frame frame) override
     {
-        return executor_.begin_invoke([=] { return consumer_->send(frame); });
+        return executor_.begin_invoke([=, this] { return consumer_->send(field, frame); });
     }
 
-    std::wstring print() const override { return consumer_ ? consumer_->print() : L"[decklink_consumer]"; }
+    std::future<bool> call(const std::vector<std::wstring>& params) override
+    {
+        return executor_.begin_invoke([=, this] { return consumer_->call(params); });
+    }
 
-    std::wstring name() const override { return L"decklink"; }
+    [[nodiscard]] std::wstring print() const override
+    {
+        return consumer_ ? consumer_->print() : L"[decklink_consumer]";
+    }
 
-    int index() const override { return 300 + config_.device_index; }
+    [[nodiscard]] std::wstring name() const override { return L"decklink"; }
 
-    bool has_synchronization_clock() const override { return true; }
+    [[nodiscard]] int index() const override { return 300 + static_cast<int>(config_.primary.device_index); }
+
+    [[nodiscard]] bool has_synchronization_clock() const override { return true; }
+
+    [[nodiscard]] core::monitor::state state() const override { return get_state_for_config(config_, format_desc_); }
 };
 
-spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wstring>&                  params,
-                                                      std::vector<spl::shared_ptr<core::video_channel>> channels)
+spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wstring>&     params,
+                                                      const core::video_format_repository& format_repository,
+                                                      const std::vector<spl::shared_ptr<core::video_channel>>& channels,
+                                                      const core::channel_info& channel_info)
 {
-    if (params.size() < 1 || !boost::iequals(params.at(0), L"DECKLINK")) {
+    if (params.empty() || !boost::iequals(params.at(0), L"DECKLINK")) {
         return core::frame_consumer::empty();
     }
 
-    configuration config;
+    configuration config = parse_amcp_config(params, format_repository, channel_info);
 
-    if (params.size() > 1)
-        config.device_index = std::stoi(params.at(1));
+    config.hdr = (channel_info.depth != common::bit_depth::bit8);
 
-    if (contains_param(L"INTERNAL_KEY", params)) {
-        config.keyer = configuration::keyer_t::internal_keyer;
-    } else if (contains_param(L"EXTERNAL_KEY", params)) {
-        config.keyer = configuration::keyer_t::external_keyer;
-    } else if (contains_param(L"EXTERNAL_SEPARATE_DEVICE_KEY", params)) {
-        config.keyer = configuration::keyer_t::external_separate_device_keyer;
-    } else {
-        config.keyer = configuration::keyer_t::default_keyer;
+    if (config.hdr && config.primary.key_only) {
+        CASPAR_THROW_EXCEPTION(caspar_exception()
+                               << msg_info("Decklink consumer does not support hdr in combination with key only"));
     }
-
-    if (contains_param(L"LOW_LATENCY", params)) {
-        config.latency = configuration::latency_t::low_latency;
-    }
-
-    config.embedded_audio = contains_param(L"EMBEDDED_AUDIO", params);
-    config.key_only       = contains_param(L"KEY_ONLY", params);
 
     return spl::make_shared<decklink_consumer_proxy>(config);
 }
 
 spl::shared_ptr<core::frame_consumer>
-create_preconfigured_consumer(const boost::property_tree::wptree&               ptree,
-                              std::vector<spl::shared_ptr<core::video_channel>> channels)
+create_preconfigured_consumer(const boost::property_tree::wptree&                      ptree,
+                              const core::video_format_repository&                     format_repository,
+                              const std::vector<spl::shared_ptr<core::video_channel>>& channels,
+                              const core::channel_info&                                channel_info)
 {
-    configuration config;
+    configuration config = parse_xml_config(ptree, format_repository, channel_info);
 
-    auto keyer = ptree.get(L"keyer", L"default");
-    if (keyer == L"external") {
-        config.keyer = configuration::keyer_t::external_keyer;
-    } else if (keyer == L"internal") {
-        config.keyer = configuration::keyer_t::internal_keyer;
-    } else if (keyer == L"external_separate_device") {
-        config.keyer = configuration::keyer_t::external_separate_device_keyer;
+    config.hdr = (channel_info.depth != common::bit_depth::bit8);
+
+    if (config.hdr && config.primary.key_only) {
+        CASPAR_THROW_EXCEPTION(caspar_exception()
+                               << msg_info("Decklink consumer does not support hdr in combination with key only"));
     }
-
-    auto latency = ptree.get(L"latency", L"default");
-    if (latency == L"low") {
-        config.latency = configuration::latency_t::low_latency;
-    } else if (latency == L"normal") {
-        config.latency = configuration::latency_t::normal_latency;
-    }
-
-    config.key_only          = ptree.get(L"key-only", config.key_only);
-    config.device_index      = ptree.get(L"device", config.device_index);
-    config.key_device_idx    = ptree.get(L"key-device", config.key_device_idx);
-    config.embedded_audio    = ptree.get(L"embedded-audio", config.embedded_audio);
-    config.base_buffer_depth = ptree.get(L"buffer-depth", config.base_buffer_depth);
 
     return spl::make_shared<decklink_consumer_proxy>(config);
 }

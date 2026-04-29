@@ -70,7 +70,7 @@ struct draw_frame::impl
         visitor.pop();
     }
 
-    bool operator==(const impl& other) { return frame_ == other.frame_ && transform_ == other.transform_; }
+    bool operator==(const impl& other) const { return frame_ == other.frame_ && transform_ == other.transform_; }
 };
 
 draw_frame::draw_frame()
@@ -110,8 +110,8 @@ void                   draw_frame::swap(draw_frame& other) { impl_.swap(other.im
 const frame_transform& draw_frame::transform() const { return impl_->transform_; }
 frame_transform&       draw_frame::transform() { return impl_->transform_; }
 void                   draw_frame::accept(frame_visitor& visitor) const { impl_->accept(visitor); }
-bool draw_frame::operator==(const draw_frame& other) const { return impl_ && *impl_ == *other.impl_; }
-bool draw_frame::operator!=(const draw_frame& other) const { return !(*this == other); }
+bool                   draw_frame::operator==(const draw_frame& other) const { return impl_ && *impl_ == *other.impl_; }
+bool                   draw_frame::operator!=(const draw_frame& other) const { return !(*this == other); }
 
 draw_frame draw_frame::over(draw_frame frame1, draw_frame frame2)
 {
@@ -163,7 +163,8 @@ draw_frame draw_frame::pop(const draw_frame& frame)
 
 draw_frame draw_frame::still(draw_frame frame)
 {
-    frame.transform().audio_transform.volume = 0.0;
+    frame.transform().audio_transform.volume           = 0.0;
+    frame.transform().audio_transform.immediate_volume = true;
     return frame;
 }
 

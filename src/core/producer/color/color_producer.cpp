@@ -92,22 +92,22 @@ class color_producer : public frame_producer
         : color_str_(boost::join(colors, L", "))
         , frame_(create_color_frame(this, frame_factory, colors))
     {
+        state_["color"] = color_str_;
+
         CASPAR_LOG(info) << print() << L" Initialized";
     }
 
     // frame_producer
 
-    draw_frame receive_impl(int nb_samples) override
-    {
-        CASPAR_SCOPE_EXIT { state_["color"] = color_str_; };
-        return frame_;
-    }
+    draw_frame receive_impl(const core::video_field field, int nb_samples) override { return frame_; }
 
     std::wstring print() const override { return L"color[" + color_str_ + L"]"; }
 
     std::wstring name() const override { return L"color"; }
 
     core::monitor::state state() const override { return state_; }
+
+    bool is_ready() override { return true; }
 };
 
 std::wstring get_hex_color(const std::wstring& str)

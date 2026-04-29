@@ -1,18 +1,14 @@
-cmake_minimum_required (VERSION 2.6)
+cmake_minimum_required (VERSION 3.28)
 project (protocol)
 
 set(SOURCES
+		amcp/AMCPCommand.cpp
 		amcp/AMCPCommandQueue.cpp
 		amcp/AMCPCommandsImpl.cpp
 		amcp/AMCPProtocolStrategy.cpp
 		amcp/amcp_command_repository.cpp
-
-		cii/CIICommandsImpl.cpp
-		cii/CIIProtocolStrategy.cpp
-
-		clk/CLKProtocolStrategy.cpp
-		clk/clk_commands.cpp
-		clk/clk_command_processor.cpp
+		amcp/amcp_args.cpp
+		amcp/amcp_command_repository_wrapper.cpp
 
 		osc/oscpack/OscOutboundPacketStream.cpp
 		osc/oscpack/OscPrintReceivedElements.cpp
@@ -26,24 +22,18 @@ set(SOURCES
 		util/strategy_adapters.cpp
 		util/http_request.cpp
 		util/tokenize.cpp
-
-		StdAfx.cpp
 )
+
 set(HEADERS
 		amcp/AMCPCommand.h
 		amcp/AMCPCommandQueue.h
 		amcp/AMCPCommandsImpl.h
 		amcp/AMCPProtocolStrategy.h
 		amcp/amcp_command_repository.h
+		amcp/amcp_command_repository_wrapper.h
 		amcp/amcp_shared.h
-
-		cii/CIICommand.h
-		cii/CIICommandsImpl.h
-		cii/CIIProtocolStrategy.h
-
-		clk/CLKProtocolStrategy.h
-		clk/clk_commands.h
-		clk/clk_command_processor.h
+		amcp/amcp_args.h
+		amcp/amcp_command_context.h
 
 		osc/oscpack/MessageMappingOscPacketListener.h
 		osc/oscpack/OscException.h
@@ -68,13 +58,11 @@ set(HEADERS
 		StdAfx.h
 )
 
-add_library(protocol ${SOURCES} ${HEADERS})
-add_precompiled_header(protocol StdAfx.h FORCEINCLUDE)
-configure_file("${PROJECT_SOURCE_DIR}/packages.config" "${CMAKE_CURRENT_BINARY_DIR}/packages.config")
-
-include_directories(..)
-include_directories(${BOOST_INCLUDE_PATH})
-include_directories(${TBB_INCLUDE_PATH})
+casparcg_add_library(protocol SOURCES ${SOURCES} ${HEADERS})
+target_include_directories(protocol  PRIVATE
+    ..
+    )
+target_precompile_headers(protocol PRIVATE "StdAfx.h")
 
 source_group(sources\\amcp amcp/*)
 source_group(sources\\cii cii/*)
@@ -85,4 +73,4 @@ source_group(sources\\osc osc/*)
 source_group(sources\\util util/*)
 source_group(sources ./*)
 
-target_link_libraries(protocol common core)
+target_link_libraries(protocol PRIVATE common core)

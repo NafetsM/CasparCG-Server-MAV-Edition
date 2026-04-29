@@ -25,9 +25,8 @@
 
 #include <core/mixer/image/blend_modes.h>
 
-#include <boost/optional.hpp>
-
 #include <array>
+#include <optional>
 
 namespace caspar { namespace core {
 
@@ -81,6 +80,12 @@ struct image_transform final
     double brightness = 1.0;
     double saturation = 1.0;
 
+    /**
+     * This enables the clip/crop/perspective fields.
+     * It is often desirable to have this disabled, to avoid cropping/clipping unnecessarily
+     */
+    bool enable_geometry_modifiers = false;
+
     std::array<double, 2> anchor           = {0.0, 0.0};
     std::array<double, 2> fill_translation = {0.0, 0.0};
     std::array<double, 2> fill_scale       = {1.0, 1.0};
@@ -98,9 +103,6 @@ struct image_transform final
     core::blend_mode blend_mode  = blend_mode::normal;
     int              layer_depth = 0;
 
-    image_transform& operator*=(const image_transform& other);
-    image_transform  operator*(const image_transform& other) const;
-
     static image_transform tween(double                 time,
                                  const image_transform& source,
                                  const image_transform& dest,
@@ -113,7 +115,8 @@ bool operator!=(const image_transform& lhs, const image_transform& rhs);
 
 struct audio_transform final
 {
-    double volume = 1.0;
+    double volume           = 1.0;
+    bool   immediate_volume = false; // When false, intra-frame samples are ramped from previous volume in audio mixer
 
     audio_transform& operator*=(const audio_transform& other);
     audio_transform  operator*(const audio_transform& other) const;
@@ -136,9 +139,6 @@ struct frame_transform final
     core::image_transform image_transform;
     core::audio_transform audio_transform;
 
-    frame_transform& operator*=(const frame_transform& other);
-    frame_transform  operator*(const frame_transform& other) const;
-
     static frame_transform tween(double                 time,
                                  const frame_transform& source,
                                  const frame_transform& dest,
@@ -160,7 +160,7 @@ class tweened_transform
   public:
     tweened_transform() = default;
 
-    tweened_transform(const frame_transform& source, const frame_transform& dest, int duration, const tweener& tween);
+    tweened_transform(const frame_transform& source, const frame_transform& dest, int duration, tweener tween);
 
     const frame_transform& dest() const;
 
@@ -168,6 +168,6 @@ class tweened_transform
     void            tick(int num);
 };
 
-boost::optional<chroma::legacy_type> get_chroma_mode(const std::wstring& str);
+std::optional<chroma::legacy_type> get_chroma_mode(const std::wstring& str);
 
 }} // namespace caspar::core
