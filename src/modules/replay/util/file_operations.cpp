@@ -439,7 +439,7 @@ uint32_t read_frame(mjpeg_file_handle infile,
 #ifdef REPLAY_IO_WINAPI
         ReadFile(infile, *audio, static_cast<DWORD>(audio_buf_size), &read, FALSE);
 #else
-        fread(*audio, 1, audio_buf_size, infile);
+        read = static_cast<DWORD>(fread(*audio, 1, audio_buf_size, infile));
 #endif
     }
 
