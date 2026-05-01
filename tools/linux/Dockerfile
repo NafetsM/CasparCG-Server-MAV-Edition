@@ -13,7 +13,7 @@ FROM docker.io/buildpack-deps:noble AS build-casparcg
 	ARG CXX
 	ARG GIT_HASH
 
-	RUN cmake -GNinja /source -DUSE_STATIC_BOOST=ON -DUSE_SYSTEM_CEF=OFF -DENABLE_REPLAY=OFF
+	RUN cmake -GNinja /source -DUSE_STATIC_BOOST=ON -DUSE_SYSTEM_CEF=OFF
 	
 	RUN cmake --build .
 

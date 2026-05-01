@@ -18,4 +18,7 @@ if (MSVC)
 	add_subdirectory(bluefish)
 endif()
 
-add_subdirectory(replay)
+option(ENABLE_REPLAY "Build the Replay consumer/producer module" ON)
+if (ENABLE_REPLAY)
+	add_subdirectory(replay)
+endif()

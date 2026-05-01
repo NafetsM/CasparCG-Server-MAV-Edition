@@ -21,6 +21,7 @@
 
 #ifndef REPLAY_IO_WINAPI
 #   include <common/utf.h>
+#   include <cstdint>
 #   define _FILE_OFFSET_BITS 64
 #   ifdef _WIN32
 #       ifndef fopen64
@@ -33,6 +34,10 @@
 #           define ftell64 _ftelli64
 #       endif
 #   elif defined(__x86_64__)
+        // On 64-bit Linux, fopen/fseek/ftell are already 64-bit via _FILE_OFFSET_BITS=64
+#       ifndef fopen64
+#           define fopen64 fopen
+#       endif
 #       ifndef fseek64
 #           define fseek64 fseek
 #       endif
@@ -58,6 +63,8 @@
 #   ifndef FILE_SHARE_WRITE
 #       define FILE_SHARE_WRITE 0x00000002
 #   endif
+    // DWORD is a Windows type; provide a portable equivalent for the POSIX path
+    using DWORD = std::uint32_t;
 #endif
 
 #ifdef REPLAY_IO_WINAPI

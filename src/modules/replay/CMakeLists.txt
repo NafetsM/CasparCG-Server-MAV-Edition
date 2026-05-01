@@ -30,6 +30,13 @@ casparcg_add_module_project(replay
 target_link_libraries(replay PRIVATE ${JPEG_LIBRARIES})
 target_include_directories(replay PRIVATE ${JPEG_INCLUDE_DIRS})
 
+# ── Compiler flags ────────────────────────────────────────────────────────────
+if (NOT MSVC)
+    # #pragma warning(...) directives are MSVC-specific; suppress the unknown-pragma
+    # warning on GCC/Clang so that -Werror does not turn them into build errors.
+    target_compile_options(replay PRIVATE -Wno-unknown-pragmas)
+endif()
+
 # ── IDE organisation ──────────────────────────────────────────────────────────
 set_target_properties(replay PROPERTIES FOLDER modules)
 source_group("sources"           FILES replay.h replay.cpp)

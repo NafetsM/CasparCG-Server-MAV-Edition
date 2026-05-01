@@ -180,6 +180,7 @@ jobs:
                   pacman -S --noconfirm --needed \
                     base-devel cmake ninja pkg-config \
                     boost boost-libs ffmpeg glew libglvnd \
+                    libjpeg-turbo \
                     onetbb openal sfml \
                     libxrandr simde
               env:
