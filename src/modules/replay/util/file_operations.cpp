@@ -567,6 +567,32 @@ long long write_frame(mjpeg_file_handle  outfile,
     return start_pos;
 }
 
+// ── Public: write_frame_encoded ───────────────────────────────────────────────
+
+long long write_frame_encoded(mjpeg_file_handle outfile,
+                               const uint8_t*   jpeg_data,
+                               size_t           jpeg_size,
+                               const int32_t*   audio_data,
+                               uint32_t         audio_data_length)
+{
+    long long start_pos = tell_frame(outfile);
+
+    DWORD written = 0;
+#ifdef REPLAY_IO_WINAPI
+    WriteFile(outfile, &audio_data_length, sizeof(uint32_t), &written, nullptr);
+    if (audio_data_length > 0)
+        WriteFile(outfile, audio_data, audio_data_length, &written, nullptr);
+    WriteFile(outfile, jpeg_data, static_cast<DWORD>(jpeg_size), &written, nullptr);
+#else
+    fwrite(&audio_data_length, 1, sizeof(uint32_t), outfile);
+    if (audio_data_length > 0)
+        fwrite(audio_data, 1, audio_data_length, outfile);
+    fwrite(jpeg_data, 1, jpeg_size, outfile);
+#endif
+
+    return start_pos;
+}
+
 #pragma warning(default:4267)
 
 }} // namespace caspar::replay

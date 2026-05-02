@@ -165,6 +165,14 @@ long long write_frame(mjpeg_file_handle outfile,
                       const int32_t*    audio_data,
                       uint32_t          audio_data_length);
 
+// Variant for pre-encoded JPEG: writes audio block + raw JPEG bytes to the .mav file.
+// Returns the file offset at the start of this frame (for the index).
+long long write_frame_encoded(mjpeg_file_handle outfile,
+                               const uint8_t*   jpeg_data,
+                               size_t           jpeg_size,
+                               const int32_t*   audio_data,
+                               uint32_t         audio_data_length);
+
 uint32_t  read_frame(mjpeg_file_handle infile,
                      uint32_t*  width,
                      uint32_t*  height,

@@ -153,6 +153,45 @@ The replay consumer log should then show:
 replay_consumer[…] Recording 1920x1080 interlaced (UFF) @ 50 fps, 16ch @ 48000 Hz
 ```
 
+## GPU-Accelerated JPEG Encoding (nvJPEG)
+
+The consumer supports optional hardware-accelerated JPEG encoding via NVIDIA nvJPEG.
+Enable it at CMake configure time:
+
+```powershell
+cmake -DENABLE_NVJPEG=ON `
+      -DCUDAToolkit_ROOT="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.2" `
+      <build-dir>
+```
+
+When active, `replay_consumer` instantiates an `nvjpeg_encoder_impl` instead of
+the default `cpu_encoder_impl`. Both implement the same `jpeg_encoder` interface
+(`util/jpeg_codec.h`). If `nvjpegCreate()` fails at runtime (no CUDA device),
+the consumer falls back to the CPU encoder automatically.
+
+**Expected throughput** (RTX 3070, quality 90, Y422): ~4–6× 1080p50 streams,
+compared to ~3× 1080i50 on CPU (libjpeg-turbo).
+
+### Deployment
+
+The build copies the required CUDA runtime DLLs automatically into the output
+folder (`build/shell/Release/`) so that the target machine does not need a
+CUDA Toolkit — only a compatible NVIDIA driver is required:
+
+| DLL | Source |
+|---|---|
+| `cudart64_13.dll` | CUDA Runtime |
+| `nvjpeg64_13.dll` | nvJPEG library |
+
+### Log output on startup of a consumer
+
+```
+[info]  nvJPEG encoder initialized on GPU: NVIDIA GeForce RTX 3070 (CUDA compute 8.6), quality=90
+[info]  replay_consumer: JPEG encoder = nvJPEG (GPU)
+```
+
+---
+
 ## Known Limitations
 
 - A sample-rate mismatch between recording and playback channel causes incorrect
@@ -177,3 +216,6 @@ replay_consumer[…] Recording 1920x1080 interlaced (UFF) @ 50 fps, 16ch @ 48000
 - [producer/replay_producer.cpp](producer/replay_producer.cpp) – playback (incl. slow-motion blending)
 - [util/file_operations.{h,cpp}](util/file_operations.h) – `.mav`/`.idx` header and JPEG I/O
 - [util/frame_operations.{h,cpp}](util/frame_operations.h) – field/frame interlacing, blending
+- [util/jpeg_codec.h](util/jpeg_codec.h) – abstract `jpeg_encoder` interface
+- [util/jpeg_codec_cpu.cpp](util/jpeg_codec_cpu.cpp) – CPU encoder (libjpeg-turbo, always available)
+- [util/jpeg_codec_nvjpeg.cpp](util/jpeg_codec_nvjpeg.cpp) – GPU encoder (nvJPEG, compiled only with `ENABLE_NVJPEG`)

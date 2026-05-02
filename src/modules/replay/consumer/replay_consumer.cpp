@@ -9,6 +9,7 @@
 
 #include "../util/frame_operations.h"
 #include "../util/file_operations.h"
+#include "../util/jpeg_codec.h"
 
 #include <core/frame/frame.h>
 #include <core/consumer/frame_consumer.h>
@@ -55,6 +56,8 @@ struct replay_consumer : public core::frame_consumer
     executor                                    encode_executor_;
     spl::shared_ptr<diagnostics::graph>         graph_;
     boost::posix_time::ptime                    start_timecode_;
+    std::unique_ptr<jpeg_encoder>               encoder_;
+    std::vector<uint8_t>                        jpeg_buf_;
 
 public:
     replay_consumer(const std::wstring& filename, short quality, chroma_subsampling subsampling)
@@ -64,6 +67,19 @@ public:
         , encode_executor_(L"replay_consumer")
     {
         encode_executor_.set_capacity(REPLAY_FRAME_BUFFER);
+
+#ifdef ENABLE_NVJPEG
+        encoder_ = create_nvjpeg_encoder(quality_, subsampling_);
+        if (!encoder_) {
+            CASPAR_LOG(warning) << L"replay_consumer: nvJPEG unavailable, falling back to CPU encoder (libjpeg-turbo)";
+            encoder_ = create_cpu_encoder(quality_, subsampling_);
+        } else {
+            CASPAR_LOG(info) << L"replay_consumer: JPEG encoder = nvJPEG (GPU)";
+        }
+#else
+        encoder_ = create_cpu_encoder(quality_, subsampling_);
+        CASPAR_LOG(info) << L"replay_consumer: JPEG encoder = libjpeg-turbo (CPU)";
+#endif
 
         graph_->set_color("frame-time",     diagnostics::color(0.1f, 1.0f, 0.1f));
         graph_->set_color("dropped-frame",  diagnostics::color(0.3f, 0.6f, 0.3f));
@@ -233,18 +249,33 @@ private:
                             mjpeg_process_mode  mode,
                             uint32_t            out_height)
     {
-        long long written = write_frame(
+        // Determine the source row pointer and stride for this field:
+        //   progressive  → start at row 0, stride = width * 4
+        //   interlaced UPPER-field → start at row 0, stride = width * 4 * 2
+        //   interlaced LOWER-field → start at row 1, stride = width * 4 * 2
+        const int     pixel_stride = format_desc_.width * 4;
+        const uint8_t* bgrx_src    = frame.image_data(0).begin();
+        int            src_stride  = pixel_stride;
+
+        if (mode == mjpeg_process_mode::LOWER)
+            bgrx_src += pixel_stride;   // advance one full row to reach the lower field
+        if (mode != mjpeg_process_mode::PROGRESSIVE)
+            src_stride = pixel_stride * 2;
+
+        if (!encoder_->encode(bgrx_src, static_cast<int>(format_desc_.width),
+                              static_cast<int>(out_height), src_stride, jpeg_buf_)) {
+            CASPAR_LOG(error) << print() << L" JPEG encode failed";
+            return;
+        }
+
+        long long pos = write_frame_encoded(
             output_file_,
-            format_desc_.width,
-            out_height,
-            frame.image_data(0).begin(),
-            quality_,
-            mode,
-            subsampling_,
+            jpeg_buf_.data(),
+            jpeg_buf_.size(),
             frame.audio_data().begin(),
             static_cast<uint32_t>(frame.audio_data().size() * sizeof(int32_t)));
 
-        write_index(output_idx_file_, written);
+        write_index(output_idx_file_, pos);
         ++framenum_;
     }
 };

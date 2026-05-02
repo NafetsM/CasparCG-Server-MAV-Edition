@@ -13,6 +13,8 @@ set(SOURCES
     util/file_operations.h
     util/frame_operations.cpp
     util/frame_operations.h
+    util/jpeg_codec.h
+    util/jpeg_codec_cpu.cpp
     replay.cpp
     replay.h
 )
@@ -29,6 +31,30 @@ casparcg_add_module_project(replay
 # ── libjpeg link ──────────────────────────────────────────────────────────────
 target_link_libraries(replay PRIVATE ${JPEG_LIBRARIES})
 target_include_directories(replay PRIVATE ${JPEG_INCLUDE_DIRS})
+
+# ── optionales nvJPEG ─────────────────────────────────────────────────────────
+option(ENABLE_NVJPEG "GPU-beschleunigtes JPEG via NVIDIA nvJPEG" OFF)
+
+if(ENABLE_NVJPEG)
+    find_package(CUDAToolkit REQUIRED)
+    target_compile_definitions(replay PRIVATE ENABLE_NVJPEG)
+    target_link_libraries(replay PRIVATE
+        CUDA::cudart
+        CUDA::nvjpeg
+    )
+    target_sources(replay PRIVATE util/jpeg_codec_nvjpeg.cpp)
+    message(STATUS "replay: nvJPEG encoder enabled (CUDA ${CUDAToolkit_VERSION})")
+
+    # Copy CUDA runtime DLLs to the shell output directory so the Release folder
+    # is self-contained and can be deployed without a CUDA Toolkit on the target machine.
+    add_custom_command(TARGET replay POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:CUDA::cudart>
+            $<TARGET_FILE:CUDA::nvjpeg>
+            "${CMAKE_BINARY_DIR}/shell/$<CONFIG>/"
+        COMMENT "Copying CUDA runtime DLLs to shell output"
+    )
+endif()
 
 # ── Compiler flags ────────────────────────────────────────────────────────────
 if (NOT MSVC)
