@@ -204,7 +204,7 @@ struct ffmpeg_producer : public core::frame_producer
 boost::tribool has_valid_extension(const boost::filesystem::path& filename)
 {
     static const auto invalid_exts = {
-        L".tga", L".tiff", L".tif", L".jp2", L".jpx", L".j2k", L".j2c", L".swf", L".ct", L".html", L".htm"};
+        L".tga", L".tiff", L".tif", L".jp2", L".jpx", L".j2k", L".j2c", L".swf", L".ct", L".html", L".htm", L".mav", L".idx"};
     static const auto valid_exts = {L".m2t",  L".m2ts",   L".mov",  L".mp4", L".dv",  L".flv", L".mpg",  L".dnxhd",
                                     L".h264", L".prores", L".mkv",  L".mxf", L".ts",  L".mp3", L".wav",  L".wma",
                                     L".nut",  L".flac",   L".opus", L".ogg", L".ogv", L".oga", L".webm", L".webp"};

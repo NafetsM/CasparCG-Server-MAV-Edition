@@ -213,6 +213,28 @@ struct replay_producer : public core::frame_producer
                         if (interlaced_ && !(real_last_framenum_ & 1))
                             --real_last_framenum_;
 
+                        // At the live edge of an open-ended recording, don't
+                        // flood the buffer with still frames — wait for the
+                        // consumer to write the next entry instead.  When the
+                        // buffer runs dry, receive_impl falls back to
+                        // last_frame_ automatically, which is far smoother
+                        // than the stop-go jitter caused by draining a buffer
+                        // full of identical stills.
+                        if (!seeked_ && speed_ != 0.0f && last_framenum_ == 0 &&
+                            !reverse_ && framenum_ >= real_last_framenum_)
+                        {
+                            // Sleep for one entry period so the consumer has
+                            // time to write the next entry before we check again.
+                            // fps stores the frame rate; for interlaced files the
+                            // entry rate is fps*2 (one entry per field).
+                            double entry_rate = interlaced_
+                                ? index_header_->fps * 2.0
+                                : index_header_->fps;
+                            int sleep_ms = static_cast<int>(1000.0 / entry_rate);
+                            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+                            continue;
+                        }
+
                         auto frame_pair = render_frame(0);
                         {
                             std::lock_guard<std::mutex> lock(frame_buffer_mutex_);
@@ -231,7 +253,10 @@ struct replay_producer : public core::frame_producer
                 }
                 else
                 {
-                    int sleep_ms = static_cast<int>(500.0 / index_header_->fps);
+                    double entry_rate = interlaced_
+                        ? index_header_->fps * 2.0
+                        : index_header_->fps;
+                    int sleep_ms = static_cast<int>(1000.0 / entry_rate);
                     std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
                 }
             }
