@@ -14,24 +14,35 @@ A recording consists of two files in the `media/` folder:
 | File             | Contents                                                       |
 | ---------------- | -------------------------------------------------------------- |
 | `<name>.mav`     | Sequence of `[audio_size:u32][audio:int32 LE][JPEG]` per entry |
-| `<name>.idx`     | Header + 64-bit offset of each entry in `.mav`                 |
+| `<name>.idx`     | Header + 16-byte `index_entry_v4` per entry (see below)        |
 
-**Current version:** 3 (as of 2026-04-28)
+**Current version:** 4 (as of 2026-05-05, branch `feature/timecode`)
 
 Header layout (`mjpeg_file_header` + `mjpeg_file_header_ex`):
 
 ```
 magick[4]            = 'OMAV'
-version              = 3
+version              = 4
 width, height        = full frame size (also for interlaced)
 fps                  = fields/s (interlaced) or frames/s (progressive)
 field_mode           = 1 (lower-first), 2 (upper-first), 3 (progressive)
-begin_timecode       = UTC time at start
+begin_timecode       = UTC time at recording start
 video_fourcc[4]      = 'mjpg'
 audio_fourcc[4]      = 'in32'
 audio_channels       = e.g. 16
-audio_sample_rate    = Hz, e.g. 48000   (new in v3)
+audio_sample_rate    = Hz, e.g. 48000
 ```
+
+Index entry layout (`index_entry_v4`, 16 bytes):
+
+```
+file_offset            int64_t   byte offset of this entry in .mav
+timestamp_microseconds int64_t   µs since begin_timecode; INT64_MIN = gap
+```
+
+The `INDEX_DATA_OFFSET` (start of index data) equals
+`sizeof(mjpeg_file_header) + sizeof(mjpeg_file_header_ex)` and is unchanged from v3.
+The producer auto-detects the index version (`version < 4` → 8-byte v3 stride, `version >= 4` → 16-byte v4 stride).
 
 For **interlaced** recordings each MAV entry contains exactly **one field**
 (JPEG at half height, e.g. 1920×540 for 1080i50). Two consecutive entries make one full frame.
@@ -95,21 +106,61 @@ PLAY 1-1 TEST3 LENGTH 250 AUDIO 0       # 10 seconds at 25 fps, muted
 ```text
 CALL <channel>-<layer> SPEED <s>
 CALL <channel>-<layer> PAUSE
-CALL <channel>-<layer> SEEK [+|-||]<n>
+CALL <channel>-<layer> SEEK [+|-||]<n>[ms|s]
+CALL <channel>-<layer> SEEK_ABS <utc_ms>
 CALL <channel>-<layer> LENGTH <n>
 CALL <channel>-<layer> AUDIO 0|1
 ```
 
-| Command               | Effect                                                     |
-| --------------------- | ---------------------------------------------------------- |
-| `SPEED <s>`           | Change speed (same semantics as `PLAY`)                    |
-| `PAUSE`               | Set speed to `0`                                           |
-| `SEEK <n>`            | Absolute position (frame `n`)                              |
-| `SEEK +<n>`           | `n` frames forward                                         |
-| `SEEK -<n>`           | `n` frames backward                                        |
-| `SEEK \|<n>`          | `n` frames before the current live end                     |
-| `LENGTH <n>`          | Change maximum playback length (`0` = unlimited)           |
-| `AUDIO 0` / `AUDIO 1` | Mute / unmute audio during playback                       |
+| Command                  | Effect                                                                       |
+| ------------------------ | ---------------------------------------------------------------------------- |
+| `SPEED <s>`              | Change speed (same semantics as `PLAY`)                                      |
+| `PAUSE`                  | Set speed to `0`                                                             |
+| `SEEK <n>`               | Absolute position (frame `n`)                                                |
+| `SEEK +<n>`              | `n` frames forward                                                           |
+| `SEEK -<n>`              | `n` frames backward                                                          |
+| `SEEK \|<n>`             | `n` frames before the current live end                                       |
+| `SEEK \|<n>s`            | `n` seconds before the current live end (**v4 files only**)                  |
+| `SEEK \|<n>ms`           | `n` milliseconds before the current live end (**v4 files only**)             |
+| `SEEK_ABS <utc_ms>`      | Seek to the frame nearest to an absolute UTC timestamp in milliseconds (**v4 files only**) — use `file/live_edge_absolute_ms` from `INFO` to compute the target |
+| `LENGTH <n>`             | Change maximum playback length (`0` = unlimited)                             |
+| `AUDIO 0` / `AUDIO 1`   | Mute / unmute audio during playback                                          |
+
+**Time-based seek examples:**
+
+```text
+CALL 1-1 SEEK |3s          # 3 seconds before live edge
+CALL 1-1 SEEK |1500ms      # 1.5 seconds before live edge
+CALL 1-1 SEEK_ABS 1746360225000   # absolute UTC timestamp (ms since epoch)
+```
+
+**Multi-channel synchronisation workflow:**
+
+```text
+# 1. Query reference channel for live-edge UTC timestamp
+INFO 1 10      → file.live_edge_absolute_ms = 1746360225000
+
+# 2. Send all channels to the same absolute timestamp
+CALL 1-10 SEEK_ABS 1746360224000   # 1 second before live
+CALL 1-11 SEEK_ABS 1746360224000
+CALL 2-10 SEEK_ABS 1746360224000
+```
+
+### Producer State Values
+
+Readable via `INFO <channel> <layer>` (returns XML `201 INFO OK`).
+Keys use `.` as separator in the XML body.
+
+| State key                       | Type    | Description                                                        |
+| ------------------------------- | ------- | ------------------------------------------------------------------ |
+| `file/frame`                    | int × 2 | Current frame index / total frames in file                         |
+| `file/time`                     | f × 2   | Current position in seconds / total duration in seconds            |
+| `file/fps`                      | float   | Recording frame rate                                               |
+| `file/speed`                    | float   | Current playback speed                                             |
+| `file/path`                     | string  | File path (without extension)                                      |
+| `file/live_edge_absolute_ms`    | int64   | UTC timestamp of the most recent frame in the recording (ms since epoch). **v4 only.** |
+| `file/time_behind_live_ms`      | int64   | How far behind the live edge the current playback position is (ms). **v4 only.** |
+| `file/gap_detected`             | bool    | `true` if the current frame has `timestamp_microseconds == INT64_MIN` (recording gap). **v4 only.** |
 
 ## Live Replay Workflow
 
@@ -153,7 +204,7 @@ The replay consumer log should then show:
 replay_consumer[…] Recording 1920x1080 interlaced (UFF) @ 50 fps, 16ch @ 48000 Hz
 ```
 
-## GPU-Accelerated JPEG Encoding (nvJPEG)
+## GPU-Accelerated JPEG Encoding (nvJPEG, `ENABLE_NVJPEG`)
 
 The consumer supports optional hardware-accelerated JPEG encoding via NVIDIA nvJPEG.
 Enable it at CMake configure time:
@@ -195,26 +246,46 @@ CUDA Toolkit — only a compatible NVIDIA driver is required:
 ## Known Limitations
 
 - A sample-rate mismatch between recording and playback channel causes incorrect
-  audio pitch. The sample rate is stored in the header (v3) and logged on open.
+  audio pitch. The sample rate is stored in the header and logged on open.
 - Field-order heuristic in the consumer: HD interlaced (≥720 lines) → upper-field-first,
   SD interlaced → lower-field-first. Custom formats with a different field order
   may need to be added here.
 - File format version 1 (CasparCG ≤ 2.0) is no longer supported.
 - **Version 2 (before sample-rate extension)**: partially readable.
   - **Linear playback (`SPEED 1`) works** — the index stream is read sequentially.
-  - **`SEEK`, `SPEED ≠ 1`, pause/resume, and reverse playback do not work**, because
-    `INDEX_DATA_OFFSET` now assumes the v3 layout (16-byte extended header) and is
-    off by 4 bytes for v2 files (12 bytes).
+  - **`SEEK`, `SPEED ≠ 1`, pause/resume, and reverse playback do not work**
+    (v2 has a 12-byte extended header vs. 16 bytes assumed by `INDEX_DATA_OFFSET`).
   - Sample rate falls back to 48000 Hz.
   - Recommendation: re-record with the current code once the file is needed for
     anything other than plain linear playback. A warning is logged on open.
+- **Version 3 files** (8-byte index entries): fully supported for all seeking and
+  speed modes. Time-based `SEEK |Ns`/`|Nms` and `SEEK_ABS` are silently ignored
+  (no timestamps available); frame-based seeking continues to work normally.
+- **Hardware timestamp gaps** (`INT64_MIN`): if the Decklink producer was not the
+  source of a frame (e.g. FFmpeg file input), `hardware_timestamp` is `-1` and the
+  index entry is written with `INT64_MIN`. Time-based seeking skips such entries
+  and lands on the next frame with a valid timestamp.
+- **NVOF frame interpolation** (Phase 3): the interface is defined in
+  `producer/nvof_interpolator.h` but the implementation (`nvof_interpolator.cpp`)
+  has not been written yet. Slow-motion currently uses the existing blend-based
+  fallback.
+
+## GPU Acceleration Options
+
+| CMake option       | Default | Description                                                     |
+| ------------------ | ------- | --------------------------------------------------------------- |
+| `ENABLE_NVJPEG`    | `OFF`   | Hardware JPEG encoding via NVIDIA nvJPEG (consumer)             |
+| `ENABLE_NVOF`      | `OFF`   | NVIDIA Optical Flow frame interpolation for slow-motion (producer, stub — not yet implemented) |
+
+Both options require `CUDAToolkit` and a compatible NVIDIA driver. See the nvJPEG section above for deployment details.
 
 ## Source Files
 
 - [replay.cpp](replay.cpp) – module registration, libjpeg version detection
-- [consumer/replay_consumer.cpp](consumer/replay_consumer.cpp) – recording
-- [producer/replay_producer.cpp](producer/replay_producer.cpp) – playback (incl. slow-motion blending)
-- [util/file_operations.{h,cpp}](util/file_operations.h) – `.mav`/`.idx` header and JPEG I/O
+- [consumer/replay_consumer.cpp](consumer/replay_consumer.cpp) – recording; writes v4 index entries with hardware timestamps
+- [producer/replay_producer.cpp](producer/replay_producer.cpp) – playback; v4/v3-aware index dispatch, time-based seeking, extended diagnostics
+- [producer/nvof_interpolator.h](producer/nvof_interpolator.h) – NVOF interpolator interface stub (implementation pending)
+- [util/file_operations.{h,cpp}](util/file_operations.h) – `.mav`/`.idx` format; v3 and v4 I/O functions, `read_timestamp_at()`
 - [util/frame_operations.{h,cpp}](util/frame_operations.h) – field/frame interlacing, blending
 - [util/jpeg_codec.h](util/jpeg_codec.h) – abstract `jpeg_encoder` interface
 - [util/jpeg_codec_cpu.cpp](util/jpeg_codec_cpu.cpp) – CPU encoder (libjpeg-turbo, always available)
