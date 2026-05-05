@@ -24,6 +24,8 @@
 #include <common/diagnostics/graph.h>
 #include <common/log.h>
 
+#include <boost/date_time/gregorian/gregorian.hpp>
+#include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/regex.hpp>
 #include <boost/algorithm/string.hpp>
@@ -32,6 +34,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <limits>
 #include <mutex>
@@ -78,6 +81,7 @@ struct replay_producer : public core::frame_producer
     uint32_t  leftovers_audio_size_= 0;
 
     bool     interlaced_    = false;
+    bool     is_v4_         = false; // true when index uses 16-byte v4 entries
     int      audio_         = 0;
     float    speed_         = 1.0f;
     float    abs_speed_     = 1.0f;
@@ -170,6 +174,7 @@ struct replay_producer : public core::frame_producer
         }
 
         interlaced_ = (index_header_->field_mode != 3);
+        is_v4_      = (index_header_->version >= 4);
         // audio == -1 → auto-enable when file has audio channels.
         // audio ==  0 → user explicitly disabled.
         // audio ==  1 → user explicitly enabled.
@@ -209,7 +214,7 @@ struct replay_producer : public core::frame_producer
                     {
                         auto t0 = std::chrono::high_resolution_clock::now();
                         real_last_framenum_ = static_cast<uint64_t>(
-                            length_index(in_idx_file_));
+                            length_index_impl());
                         if (interlaced_ && !(real_last_framenum_ & 1))
                             --real_last_framenum_;
 
@@ -323,11 +328,12 @@ struct replay_producer : public core::frame_producer
 
     std::wstring do_call(const std::wstring& param)
     {
-        static const boost::wregex speed_exp (L"SPEED\\s+(?<VALUE>[\\d.-]+)",          boost::regex::icase);
-        static const boost::wregex pause_exp (L"PAUSE",                                boost::regex::icase);
-        static const boost::wregex seek_exp  (L"SEEK\\s+(?<SIGN>[\\+\\-\\|])?(?<VALUE>[\\d]+)", boost::regex::icase);
-        static const boost::wregex length_exp(L"LENGTH\\s+(?<VALUE>[\\d]+)",           boost::regex::icase);
-        static const boost::wregex audio_exp (L"AUDIO\\s+(?<VALUE>[\\d]+)",            boost::regex::icase);
+        static const boost::wregex speed_exp    (L"SPEED\\s+(?<VALUE>[\\d.-]+)",          boost::regex::icase);
+        static const boost::wregex pause_exp    (L"PAUSE",                                boost::regex::icase);
+        static const boost::wregex seek_exp     (L"SEEK\\s+(?<SIGN>[\\+\\-\\|])?(?<VALUE>[\\d]+)(?<UNIT>ms|s)?", boost::regex::icase);
+        static const boost::wregex seek_abs_exp (L"SEEK_ABS\\s+(?<VALUE>[\\d]+)",        boost::regex::icase);
+        static const boost::wregex length_exp   (L"LENGTH\\s+(?<VALUE>[\\d]+)",           boost::regex::icase);
+        static const boost::wregex audio_exp    (L"AUDIO\\s+(?<VALUE>[\\d]+)",            boost::regex::icase);
 
         boost::wsmatch m;
 
@@ -354,8 +360,57 @@ struct replay_producer : public core::frame_producer
             }
             if (!m["VALUE"].str().empty())
             {
-                uint64_t pos = boost::lexical_cast<uint64_t>(m["VALUE"].str());
-                seek(interlaced_ ? pos * 2 : pos, sign);
+                auto unit = m["UNIT"].str();
+                if (!unit.empty() && is_v4_)
+                {
+                    // Time-based seek: "|1500ms" or "|3s" (offset back from live edge)
+                    int64_t val_raw = boost::lexical_cast<int64_t>(m["VALUE"].str());
+                    int64_t offset_us = boost::iequals(unit, L"ms")
+                                        ? val_raw * 1000LL
+                                        : val_raw * 1000000LL;
+
+                    int64_t live_ts = read_timestamp_at(in_idx_file_,
+                                          static_cast<long long>(real_last_framenum_.load()));
+                    int64_t target_us = (sign == -2 && live_ts != INT64_MIN)
+                                        ? live_ts - offset_us
+                                        : offset_us;
+                    if (target_us < 0) target_us = 0;
+
+                    uint64_t tf = seek_by_time(target_us);
+                    framenum_ = tf;
+                    seek_index_v4(in_idx_file_, static_cast<long long>(tf), FILE_BEGIN);
+                    first_framenum_ = framenum_.load();
+                    seeked_         = true;
+                }
+                else
+                {
+                    uint64_t pos = boost::lexical_cast<uint64_t>(m["VALUE"].str());
+                    seek(interlaced_ ? pos * 2 : pos, sign);
+                }
+            }
+            return L"";
+        }
+        if (boost::regex_match(param, m, seek_abs_exp))
+        {
+            if (!m["VALUE"].str().empty() && is_v4_)
+            {
+                int64_t target_epoch_ms = boost::lexical_cast<int64_t>(m["VALUE"].str());
+                auto    epoch           = boost::posix_time::ptime(
+                                              boost::gregorian::date(1970, 1, 1));
+                int64_t begin_epoch_ms  = (index_header_->begin_timecode - epoch)
+                                              .total_milliseconds();
+                int64_t target_us       = (target_epoch_ms - begin_epoch_ms) * 1000LL;
+
+                if (target_us < 0) {
+                    framenum_ = 0;
+                    seek_index_v4(in_idx_file_, 0LL, FILE_BEGIN);
+                } else {
+                    uint64_t tf = seek_by_time(target_us);
+                    framenum_ = tf;
+                    seek_index_v4(in_idx_file_, static_cast<long long>(tf), FILE_BEGIN);
+                }
+                first_framenum_ = framenum_.load();
+                seeked_         = true;
             }
             return L"";
         }
@@ -407,7 +462,7 @@ struct replay_producer : public core::frame_producer
             framenum_ = (next > rlfn) ? rlfn : next;
         }
 
-        if (seek_index(in_idx_file_, static_cast<long long>(framenum_), FILE_BEGIN))
+        if (seek_index_impl(static_cast<long long>(framenum_), FILE_BEGIN))
             CASPAR_LOG(error) << L"[replay] seek_index failed at frame " << framenum_;
 
         first_framenum_ = framenum_.load();
@@ -424,6 +479,44 @@ struct replay_producer : public core::frame_producer
             frame_divider_ = 0;
         frame_multiplier_ = std::abs(static_cast<int>(speed));
         reverse_          = (speed < 0.0f);
+    }
+
+    // ── Version-aware index wrappers ──────────────────────────────────────────
+
+    long long length_index_impl() const
+    {
+        return is_v4_ ? length_index_v4(in_idx_file_) : length_index(in_idx_file_);
+    }
+
+    int seek_index_impl(long long frame, uint32_t origin)
+    {
+        return is_v4_ ? seek_index_v4(in_idx_file_, frame, origin)
+                      : seek_index(in_idx_file_, frame, origin);
+    }
+
+    long long read_index_impl()
+    {
+        if (is_v4_) {
+            auto e = read_index_v4(in_idx_file_);
+            return e.file_offset;
+        }
+        return read_index(in_idx_file_);
+    }
+
+    // Binary search for the first frame whose timestamp >= target_us.
+    uint64_t seek_by_time(int64_t target_us)
+    {
+        uint64_t lo = 0;
+        uint64_t hi = real_last_framenum_.load();
+        while (lo < hi) {
+            uint64_t mid = (lo + hi) / 2;
+            int64_t  ts  = read_timestamp_at(in_idx_file_, static_cast<long long>(mid));
+            if (ts == INT64_MIN || ts < target_us)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        return lo;
     }
 
     void update_diag(double elapsed)
@@ -449,6 +542,19 @@ struct replay_producer : public core::frame_producer
         state_["file/fps"]   = fps;
         state_["file/path"]  = filename_;
         state_["file/speed"] = speed_;
+
+        if (is_v4_) {
+            int64_t live_ts = read_timestamp_at(in_idx_file_, static_cast<long long>(rlfn));
+            int64_t cur_ts  = read_timestamp_at(in_idx_file_, static_cast<long long>(rfn));
+            if (live_ts != INT64_MIN && cur_ts != INT64_MIN) {
+                auto    epoch          = boost::posix_time::ptime(boost::gregorian::date(1970, 1, 1));
+                int64_t begin_epoch_ms = (index_header_->begin_timecode - epoch).total_milliseconds();
+                state_["file/live_edge_absolute_ms"] = begin_epoch_ms + live_ts / 1000;
+                state_["file/time_behind_live_ms"]   = (live_ts - cur_ts) / 1000;
+            }
+            state_["file/gap_detected"] =
+                (read_timestamp_at(in_idx_file_, static_cast<long long>(rfn)) == INT64_MIN);
+        }
     }
 
     // ── Frame rendering helpers ───────────────────────────────────────────────
@@ -479,7 +585,7 @@ struct replay_producer : public core::frame_producer
         }
 
         if (seek_needed &&
-            seek_index(in_idx_file_, static_cast<long long>(framenum_), FILE_BEGIN))
+            seek_index_impl(static_cast<long long>(framenum_), FILE_BEGIN))
             CASPAR_LOG(error) << L"[replay] move_to_next_frame: seek_index failed";
     }
 
@@ -536,7 +642,7 @@ struct replay_producer : public core::frame_producer
         // ── Decode frames until output frame is filled ────────────────────────
         while (filled < 64)
         {
-            long long field_pos = read_index(in_idx_file_);
+            long long field_pos = read_index_impl();
             if (field_pos == -1)
             {
                 // EOF
@@ -673,7 +779,7 @@ struct replay_producer : public core::frame_producer
             leftovers_audio_size_ = 0;
         }
 
-        long long field_pos = read_index(in_idx_file_);
+        long long field_pos = read_index_impl();
         if (field_pos == -1)
             return { frame_, framenum_ };
 

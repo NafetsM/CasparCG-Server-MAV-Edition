@@ -63,6 +63,17 @@ if (NOT MSVC)
     target_compile_options(replay PRIVATE -Wno-unknown-pragmas)
 endif()
 
+# ── optional NVOF (NVIDIA Optical Flow frame interpolation) ───────────────────
+option(ENABLE_NVOF "Enable NVIDIA Optical Flow interpolation for slow-motion replay" OFF)
+
+if(ENABLE_NVOF)
+    find_package(CUDAToolkit REQUIRED)
+    target_compile_definitions(replay PRIVATE ENABLE_NVOF)
+    target_link_libraries(replay PRIVATE CUDA::cudart)
+    target_sources(replay PRIVATE producer/nvof_interpolator.cpp)
+    message(STATUS "replay: NVOF interpolation enabled (CUDA ${CUDAToolkit_VERSION})")
+endif()
+
 # ── IDE organisation ──────────────────────────────────────────────────────────
 set_target_properties(replay PROPERTIES FOLDER modules)
 source_group("sources"           FILES replay.h replay.cpp)

@@ -57,6 +57,9 @@ core::mutable_frame make_frame(void*                            tag,
         frame.geometry() = core::frame_geometry::get_default(scale_mode);
     }
 
+    if (video && video->pts != AV_NOPTS_VALUE)
+        frame.set_hardware_timestamp(video->pts);
+
     tbb::parallel_invoke(
         [&]() {
             if (video) {

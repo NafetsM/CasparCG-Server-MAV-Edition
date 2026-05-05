@@ -55,6 +55,8 @@ class mutable_frame final
 
     const void* stream_tag() const;
 
+    void set_hardware_timestamp(int64_t us);
+
     class frame_geometry&       geometry();
     const class frame_geometry& geometry() const;
 
@@ -95,6 +97,8 @@ class const_frame final
 
     const void* stream_tag() const;
     const_frame with_tag(const void* new_tag) const;
+
+    int64_t hardware_timestamp() const;  // µs since recording start; -1 if not set
 
     const std::any& opaque() const;
 

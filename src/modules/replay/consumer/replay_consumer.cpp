@@ -56,6 +56,7 @@ struct replay_consumer : public core::frame_consumer
     executor                                    encode_executor_;
     spl::shared_ptr<diagnostics::graph>         graph_;
     boost::posix_time::ptime                    start_timecode_;
+    int64_t                                     start_hardware_ts_ = -1; // µs from hardware clock at first frame
     std::unique_ptr<jpeg_encoder>               encoder_;
     std::vector<uint8_t>                        jpeg_buf_;
 
@@ -275,7 +276,18 @@ private:
             frame.audio_data().begin(),
             static_cast<uint32_t>(frame.audio_data().size() * sizeof(int32_t)));
 
-        write_index(output_idx_file_, pos);
+        // Derive per-frame timestamp from hardware clock
+        int64_t hw_ts  = frame.hardware_timestamp();
+        int64_t ts_us;
+        if (hw_ts >= 0) {
+            if (start_hardware_ts_ < 0)
+                start_hardware_ts_ = hw_ts;
+            ts_us = hw_ts - start_hardware_ts_;
+        } else {
+            ts_us = INT64_MIN; // gap — no hardware timestamp available
+        }
+
+        write_index_v4(output_idx_file_, { pos, ts_us });
         ++framenum_;
     }
 };

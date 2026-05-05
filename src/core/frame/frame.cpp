@@ -40,6 +40,7 @@ struct mutable_frame::impl
     const void*                      tag_;
     frame_geometry                   geometry_ = frame_geometry::get_default();
     mutable_frame::commit_t          commit_;
+    int64_t                          hardware_timestamp_ = -1;
 
     impl(const impl&)            = delete;
     impl& operator=(const impl&) = delete;
@@ -97,6 +98,7 @@ struct const_frame::impl
     frame_geometry                         geometry_ = frame_geometry::get_default();
     std::any                               opaque_;
     std::shared_ptr<core::texture>         texture_;
+    int64_t                                hardware_timestamp_ = -1;
 
     impl(const void*                            tag,
          std::vector<array<const std::uint8_t>> image_data,
@@ -122,6 +124,7 @@ struct const_frame::impl
         , tag_(other.stream_tag())
         , texture_(nullptr)
         , geometry_(std::move(other.impl_->geometry_))
+        , hardware_timestamp_(other.impl_->hardware_timestamp_)
     {
         if (desc_.planes.size() != image_data_.size() && !other.impl_->commit_) {
             CASPAR_THROW_EXCEPTION(invalid_argument());
@@ -187,7 +190,8 @@ const_frame                      const_frame::with_tag(const void* new_tag) cons
     auto                                   new_frame =
         const_frame(new_tag, std::move(image_data_copy), impl_->audio_data_, impl_->desc_, impl_->texture_);
 
-    new_frame.impl_->geometry_ = impl_->geometry_;
+    new_frame.impl_->geometry_           = impl_->geometry_;
+    new_frame.impl_->hardware_timestamp_ = impl_->hardware_timestamp_;
     if (impl_->opaque_.has_value()) {
         new_frame.impl_->opaque_ = impl_->opaque_;
     }
@@ -197,4 +201,6 @@ const_frame                      const_frame::with_tag(const void* new_tag) cons
 const frame_geometry& const_frame::geometry() const { return impl_->geometry_; }
 const std::any&       const_frame::opaque() const { return impl_->opaque_; }
 const_frame::operator bool() const { return impl_ != nullptr && impl_->desc_.format != core::pixel_format::invalid; }
+void    mutable_frame::set_hardware_timestamp(int64_t us) { impl_->hardware_timestamp_ = us; }
+int64_t const_frame::hardware_timestamp() const { return impl_ ? impl_->hardware_timestamp_ : -1; }
 }} // namespace caspar::core

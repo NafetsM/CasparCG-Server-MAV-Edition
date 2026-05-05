@@ -99,7 +99,15 @@ struct mjpeg_file_header_ex
     int     audio_sample_rate;  // Hz (added in v3; v2 files default to 48000)
 };
 
-static constexpr uint8_t MJPEG_FILE_VERSION = 3;
+static constexpr uint8_t MJPEG_FILE_VERSION  = 3; // last v3-format version
+static constexpr uint8_t MAV_VERSION_CURRENT = 4; // current write version
+
+// v4 index entry – 16 bytes per frame
+struct index_entry_v4
+{
+    int64_t file_offset;             // byte offset in .mav
+    int64_t timestamp_microseconds;  // µs since begin_timecode; INT64_MIN = gap
+};
 
 #pragma pack(pop)
 
@@ -136,6 +144,10 @@ void              safe_fclose(mjpeg_file_handle handle);
 
 // ── Index operations ─────────────────────────────────────────────────────────
 
+// Byte offset where index entries begin (same for v3 and v4 – header size unchanged)
+static constexpr long long INDEX_DATA_OFFSET =
+    sizeof(mjpeg_file_header) + sizeof(mjpeg_file_header_ex);
+
 void      write_index_header(mjpeg_file_handle idx,
                              const core::video_format_desc* format_desc,
                              boost::posix_time::ptime       start_timecode,
@@ -143,12 +155,21 @@ void      write_index_header(mjpeg_file_handle idx,
                              int                            audio_sample_rate,
                              uint8_t                        field_mode);
 
+// v3 (8-byte entry) – kept for reading legacy files
 void      write_index(mjpeg_file_handle idx, long long offset);
-
-long long read_index(mjpeg_file_handle idx);
-long long tell_index(mjpeg_file_handle idx);
+long long read_index (mjpeg_file_handle idx);
+long long tell_index (mjpeg_file_handle idx);
 long long length_index(mjpeg_file_handle idx);
-int       seek_index(mjpeg_file_handle idx, long long frame, uint32_t origin);
+int       seek_index (mjpeg_file_handle idx, long long frame, uint32_t origin);
+
+// v4 (16-byte entry)
+void           write_index_v4  (mjpeg_file_handle idx, const index_entry_v4& entry);
+index_entry_v4 read_index_v4   (mjpeg_file_handle idx);
+long long      tell_index_v4   (mjpeg_file_handle idx);
+long long      length_index_v4 (mjpeg_file_handle idx);
+int            seek_index_v4   (mjpeg_file_handle idx, long long frame, uint32_t origin);
+// Read only the timestamp of a specific frame without disturbing the sequential read position
+int64_t        read_timestamp_at(mjpeg_file_handle idx, long long frame);
 
 int       read_index_header   (mjpeg_file_handle idx, mjpeg_file_header**    out);
 int       read_index_header_ex(mjpeg_file_handle idx, uint8_t version, mjpeg_file_header_ex** out);

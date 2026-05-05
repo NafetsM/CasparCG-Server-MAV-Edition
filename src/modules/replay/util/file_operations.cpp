@@ -92,7 +92,7 @@ void write_index_header(mjpeg_file_handle idx,
     mjpeg_file_header hdr{};
     hdr.magick[0] = 'O'; hdr.magick[1] = 'M';
     hdr.magick[2] = 'A'; hdr.magick[3] = 'V';
-    hdr.version        = MJPEG_FILE_VERSION;
+    hdr.version        = MAV_VERSION_CURRENT;
     hdr.width          = fmt->width;
     hdr.height         = fmt->height;
     hdr.fps            = fmt->fps;
@@ -189,9 +189,6 @@ long long read_index(mjpeg_file_handle idx)
     return (read > 0) ? offset : -1LL;
 }
 
-static constexpr long long INDEX_DATA_OFFSET =
-    sizeof(mjpeg_file_header) + sizeof(mjpeg_file_header_ex);
-
 int seek_index(mjpeg_file_handle idx, long long frame, uint32_t origin)
 {
 #ifdef REPLAY_IO_WINAPI
@@ -238,6 +235,109 @@ long long length_index(mjpeg_file_handle idx)
     long long len = (ftell64(idx) - INDEX_DATA_OFFSET) / sizeof(long long);
     fseek64(idx, cur, SEEK_SET);
     return len;
+#endif
+}
+
+// ── v4 index operations (16-byte entries) ────────────────────────────────────
+
+void write_index_v4(mjpeg_file_handle idx, const index_entry_v4& entry)
+{
+    DWORD written = 0;
+#ifdef REPLAY_IO_WINAPI
+    WriteFile(idx, &entry, sizeof(index_entry_v4), &written, nullptr);
+#else
+    fwrite(&entry, 1, sizeof(index_entry_v4), idx);
+#endif
+}
+
+index_entry_v4 read_index_v4(mjpeg_file_handle idx)
+{
+    index_entry_v4 entry{};
+    entry.file_offset = -1LL;
+    DWORD read = 0;
+#ifdef REPLAY_IO_WINAPI
+    ReadFile(idx, &entry, sizeof(index_entry_v4), &read, nullptr);
+#else
+    read = static_cast<DWORD>(fread(&entry, 1, sizeof(index_entry_v4), idx));
+#endif
+    if (read != sizeof(index_entry_v4))
+        entry.file_offset = -1LL;
+    return entry;
+}
+
+int seek_index_v4(mjpeg_file_handle idx, long long frame, uint32_t origin)
+{
+#ifdef REPLAY_IO_WINAPI
+    LARGE_INTEGER pos;
+    DWORD         whence;
+    if (origin == FILE_CURRENT)
+    {
+        pos.QuadPart = frame * static_cast<long long>(sizeof(index_entry_v4));
+        whence = FILE_CURRENT;
+    }
+    else
+    {
+        pos.QuadPart = frame * static_cast<long long>(sizeof(index_entry_v4)) + INDEX_DATA_OFFSET;
+        whence = FILE_BEGIN;
+    }
+    return SetFilePointerEx(idx, pos, nullptr, whence) ? 0 : 1;
+#else
+    if (origin == FILE_CURRENT)
+        return fseek64(idx, frame * static_cast<long long>(sizeof(index_entry_v4)), SEEK_CUR);
+    return fseek64(idx, frame * static_cast<long long>(sizeof(index_entry_v4)) + INDEX_DATA_OFFSET, SEEK_SET);
+#endif
+}
+
+long long tell_index_v4(mjpeg_file_handle idx)
+{
+#ifdef REPLAY_IO_WINAPI
+    LARGE_INTEGER zero{}, pos{};
+    SetFilePointerEx(idx, zero, &pos, FILE_CURRENT);
+    return (pos.QuadPart - INDEX_DATA_OFFSET) / static_cast<long long>(sizeof(index_entry_v4));
+#else
+    return (ftell64(idx) - INDEX_DATA_OFFSET) / static_cast<long long>(sizeof(index_entry_v4));
+#endif
+}
+
+long long length_index_v4(mjpeg_file_handle idx)
+{
+#ifdef REPLAY_IO_WINAPI
+    LARGE_INTEGER size{};
+    GetFileSizeEx(idx, &size);
+    return (size.QuadPart - INDEX_DATA_OFFSET) / static_cast<long long>(sizeof(index_entry_v4));
+#else
+    long long cur = ftell64(idx);
+    fseek64(idx, 0, SEEK_END);
+    long long len = (ftell64(idx) - INDEX_DATA_OFFSET) / static_cast<long long>(sizeof(index_entry_v4));
+    fseek64(idx, cur, SEEK_SET);
+    return len;
+#endif
+}
+
+int64_t read_timestamp_at(mjpeg_file_handle idx, long long frame)
+{
+    // timestamp_microseconds is the second int64_t in index_entry_v4
+    const long long ts_off = INDEX_DATA_OFFSET
+                           + frame * static_cast<long long>(sizeof(index_entry_v4))
+                           + static_cast<long long>(sizeof(int64_t));
+#ifdef REPLAY_IO_WINAPI
+    LARGE_INTEGER zero{}, saved{};
+    SetFilePointerEx(idx, zero, &saved, FILE_CURRENT);
+    LARGE_INTEGER pos;
+    pos.QuadPart = ts_off;
+    SetFilePointerEx(idx, pos, nullptr, FILE_BEGIN);
+    int64_t ts = INT64_MIN;
+    DWORD   rd = 0;
+    ReadFile(idx, &ts, sizeof(int64_t), &rd, nullptr);
+    SetFilePointerEx(idx, saved, nullptr, FILE_BEGIN);
+    return (rd == sizeof(int64_t)) ? ts : INT64_MIN;
+#else
+    long long cur = ftell64(idx);
+    fseek64(idx, ts_off, SEEK_SET);
+    int64_t ts = INT64_MIN;
+    DWORD   rd = static_cast<DWORD>(fread(&ts, 1, sizeof(int64_t), idx));
+    fseek64(idx, cur, SEEK_SET);
+    return (rd == sizeof(int64_t)) ? ts : INT64_MIN;
 #endif
 }
 
