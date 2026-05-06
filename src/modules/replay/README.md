@@ -9,7 +9,7 @@ adapted to the CasparCG 2.5 architecture (BGRA, updated `frame_consumer`/`frame_
 
 ## File Format
 
-A recording consists of two files in the `media/` folder:
+A recording consists of [two files](FILE.md) in the `media/` folder:
 
 | File             | Contents                                                       |
 | ---------------- | -------------------------------------------------------------- |
