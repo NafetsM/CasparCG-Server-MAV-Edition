@@ -156,11 +156,11 @@ struct replay_producer : public core::frame_producer
                                  << index_header_ex_->audio_channels << L" channels @ "
                                  << index_header_ex_->audio_sample_rate << L" Hz";
 
-                if (index_header_->version != MJPEG_FILE_VERSION)
+                if (index_header_->version > MAV_VERSION_CURRENT)
                 {
                     CASPAR_LOG(warning) << print()
                         << L" File version " << static_cast<int>(index_header_->version)
-                        << L" differs from current " << static_cast<int>(MJPEG_FILE_VERSION)
+                        << L" is newer than supported " << static_cast<int>(MAV_VERSION_CURRENT)
                         << L" — index seeks may be incorrect.";
                 }
             }
@@ -328,6 +328,7 @@ struct replay_producer : public core::frame_producer
 
     std::wstring do_call(const std::wstring& param)
     {
+        static const boost::wregex play_exp     (L"PLAY",                                 boost::regex::icase);
         static const boost::wregex speed_exp    (L"SPEED\\s+(?<VALUE>[\\d.-]+)",          boost::regex::icase);
         static const boost::wregex pause_exp    (L"PAUSE",                                boost::regex::icase);
         static const boost::wregex seek_exp     (L"SEEK\\s+(?<SIGN>[\\+\\-\\|])?(?<VALUE>[\\d]+)(?<UNIT>ms|s)?", boost::regex::icase);
@@ -337,6 +338,12 @@ struct replay_producer : public core::frame_producer
 
         boost::wsmatch m;
 
+        if (boost::regex_match(param, m, play_exp))
+        {
+            if (speed_ == 0.0f)
+                set_playback_speed(1.0f);
+            return L"";
+        }
         if (boost::regex_match(param, m, pause_exp))
         {
             set_playback_speed(0.0f);
@@ -369,8 +376,10 @@ struct replay_producer : public core::frame_producer
                                         ? val_raw * 1000LL
                                         : val_raw * 1000000LL;
 
-                    int64_t live_ts = read_timestamp_at(in_idx_file_,
-                                          static_cast<long long>(real_last_framenum_.load()));
+                    uint64_t rlfn_do = real_last_framenum_.load();
+                    int64_t live_ts = (rlfn_do > 0)
+                        ? read_timestamp_at(in_idx_file_, static_cast<long long>(rlfn_do - 1))
+                        : INT64_MIN;
                     int64_t target_us = (sign == -2 && live_ts != INT64_MIN)
                                         ? live_ts - offset_us
                                         : offset_us;
@@ -544,7 +553,9 @@ struct replay_producer : public core::frame_producer
         state_["file/speed"] = speed_;
 
         if (is_v4_) {
-            int64_t live_ts = read_timestamp_at(in_idx_file_, static_cast<long long>(rlfn));
+            int64_t live_ts = (rlfn > 0)
+                ? read_timestamp_at(in_idx_file_, static_cast<long long>(rlfn - 1))
+                : INT64_MIN;
             int64_t cur_ts  = read_timestamp_at(in_idx_file_, static_cast<long long>(rfn));
             if (live_ts != INT64_MIN && cur_ts != INT64_MIN) {
                 auto    epoch          = boost::posix_time::ptime(boost::gregorian::date(1970, 1, 1));

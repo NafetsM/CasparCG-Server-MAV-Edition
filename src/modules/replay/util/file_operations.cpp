@@ -244,9 +244,11 @@ void write_index_v4(mjpeg_file_handle idx, const index_entry_v4& entry)
 {
     DWORD written = 0;
 #ifdef REPLAY_IO_WINAPI
-    WriteFile(idx, &entry, sizeof(index_entry_v4), &written, nullptr);
+    WriteFile(idx, &entry.file_offset,            sizeof(entry.file_offset),            &written, nullptr);
+    WriteFile(idx, &entry.timestamp_microseconds, sizeof(entry.timestamp_microseconds), &written, nullptr);
 #else
-    fwrite(&entry, 1, sizeof(index_entry_v4), idx);
+    fwrite(&entry.file_offset,            1, sizeof(entry.file_offset),            idx);
+    fwrite(&entry.timestamp_microseconds, 1, sizeof(entry.timestamp_microseconds), idx);
 #endif
 }
 
@@ -254,13 +256,15 @@ index_entry_v4 read_index_v4(mjpeg_file_handle idx)
 {
     index_entry_v4 entry{};
     entry.file_offset = -1LL;
-    DWORD read = 0;
+    DWORD read1 = 0, read2 = 0;
 #ifdef REPLAY_IO_WINAPI
-    ReadFile(idx, &entry, sizeof(index_entry_v4), &read, nullptr);
+    ReadFile(idx, &entry.file_offset,            sizeof(entry.file_offset),            &read1, nullptr);
+    ReadFile(idx, &entry.timestamp_microseconds, sizeof(entry.timestamp_microseconds), &read2, nullptr);
 #else
-    read = static_cast<DWORD>(fread(&entry, 1, sizeof(index_entry_v4), idx));
+    read1 = static_cast<DWORD>(fread(&entry.file_offset,            1, sizeof(entry.file_offset),            idx));
+    read2 = static_cast<DWORD>(fread(&entry.timestamp_microseconds, 1, sizeof(entry.timestamp_microseconds), idx));
 #endif
-    if (read != sizeof(index_entry_v4))
+    if (read1 != sizeof(entry.file_offset) || read2 != sizeof(entry.timestamp_microseconds))
         entry.file_offset = -1LL;
     return entry;
 }

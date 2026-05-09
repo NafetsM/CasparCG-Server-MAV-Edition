@@ -99,7 +99,6 @@ struct mjpeg_file_header_ex
     int     audio_sample_rate;  // Hz (added in v3; v2 files default to 48000)
 };
 
-static constexpr uint8_t MJPEG_FILE_VERSION  = 3; // last v3-format version
 static constexpr uint8_t MAV_VERSION_CURRENT = 4; // current write version
 
 // v4 index entry – 16 bytes per frame

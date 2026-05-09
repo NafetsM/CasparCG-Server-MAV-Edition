@@ -276,7 +276,8 @@ private:
             frame.audio_data().begin(),
             static_cast<uint32_t>(frame.audio_data().size() * sizeof(int32_t)));
 
-        // Derive per-frame timestamp from hardware clock
+        // Derive per-frame timestamp.
+        // Prefer hardware clock (DeckLink); fall back to frame-counter + fps.
         int64_t hw_ts  = frame.hardware_timestamp();
         int64_t ts_us;
         if (hw_ts >= 0) {
@@ -284,10 +285,17 @@ private:
                 start_hardware_ts_ = hw_ts;
             ts_us = hw_ts - start_hardware_ts_;
         } else {
-            ts_us = INT64_MIN; // gap — no hardware timestamp available
+            // No hardware timestamp: synthesize from frame counter so that
+            // time-based seeking and live_edge_absolute_ms still work.
+            ts_us = static_cast<int64_t>(
+                static_cast<double>(framenum_) * 1000000.0 /
+                (format_desc_.fps * static_cast<double>(format_desc_.field_count)));
         }
 
-        write_index_v4(output_idx_file_, { pos, ts_us });
+        index_entry_v4 idx_entry;
+        idx_entry.file_offset            = static_cast<int64_t>(pos);
+        idx_entry.timestamp_microseconds = ts_us;
+        write_index_v4(output_idx_file_, idx_entry);
         ++framenum_;
     }
 };
